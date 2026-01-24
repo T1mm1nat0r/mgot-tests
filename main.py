@@ -1,10 +1,15 @@
 """
-Merged service: 03_leveler + 04_zone_updater
+03_levels_and_zones - Merged service: 03_leveler + 04_zone_updater
 
 This service:
 1. Processes level achievements (gains/losses) for each bar
 2. Updates zone completion states based on achievements
 3. Passes bar to peaks finder
+
+Optimized for speed with:
+- Fresh Redis pipelines per operation
+- Batch Redis operations
+- Optimized Kafka settings
 """
 
 import os
@@ -14,25 +19,26 @@ from mgot_utils import *
 
 config = Config()
 
-# Redis - use single connection with connection pooling
+# Redis - single connection, fresh pipelines per operation
 r = connect_to_redis()
 pub = r.pubsub()
 pub.subscribe('processed_bar')
 
-# Kafka - optimized settings
+# Kafka - optimized settings for throughput
 bootstrap = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'redpanda:9092')
 producer_conf = {
     'bootstrap.servers': bootstrap,
-    'client.id': '03_leveler_and_updater-producer',
+    'client.id': '03_levels_and_zones-producer',
     'linger.ms': 5,
     'batch.num.messages': 100,
+    'queue.buffering.max.kbytes': 32768,
 }
 consumer_conf = {
     'bootstrap.servers': bootstrap,
-    'group.id': '03_leveler_and_updater-group',
+    'group.id': '03_levels_and_zones-group',
     'auto.offset.reset': 'earliest',
     'fetch.min.bytes': 1024,
-    'fetch.wait.max.ms': 100,
+    'fetch.wait.max.ms': 50,
 }
 
 producer = Producer(producer_conf)
@@ -128,14 +134,18 @@ def collect_affected_zones(lost_levels: list[Level], gained_levels: list[Level])
 # ZONE UPDATE PROCESSING (from 04_zone_updater)
 # =============================================================================
 
-def process_zone_updates(bar: Bar) -> None:
+def process_zone_updates(bar: Bar, affected_zones: list[str]) -> None:
     """
     Post-process zones that were affected by this bar's level achievements.
+    Only processes zones that were actually affected.
     """
+    if not affected_zones:
+        return
+    
     pipe = r.pipeline()
     
-    # Fetch zones referenced in bar achievements
-    zones = Zone.fetch_from_bar_achievements(bar, pipe)
+    # Fetch only affected zones in batch
+    zones = Zone.fetch_many(affected_zones, pipe) if affected_zones else []
     
     # Post-process each zone (updates completion state)
     for zone in zones:
@@ -176,14 +186,17 @@ def main(value, producer):
     # Step 1: Process level achievements (was 03_leveler)
     affected_zones = process_level_achievements(bar, r)
     
-    # Store achievements on bar
+    # Store achievements on bar - use fresh pipeline
+    pipe = r.pipeline()
     bar.achievements = ', '.join(affected_zones) if affected_zones else ''
-    bar.sync_with_db(r)
+    bar.sync_with_db(pipe)
+    pipe.execute()
     
-    # Step 2: Update zone states (was 04_zone_updater)
-    process_zone_updates(bar)
+    # Step 2: Update zone states (was 04_zone_updater) - only if zones affected
+    if affected_zones:
+        process_zone_updates(bar, affected_zones)
     
-    # Step 3: Send to next service (05_peaks_and_structure)
+    # Step 3: Send to next service (04_peaks_and_structures)
     try:
         produce_with_retry(producer, 'leveled_and_updated', bar.model_dump_json(), key=bar.id)
     except Exception as e:
