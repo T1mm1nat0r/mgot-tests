@@ -1,0 +1,16 @@
+[project]
+name = "03-leveler-and-updater"
+version = "0.1.0"
+description = "Merged service: Level achievement processing and zone updates"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mgot_utils @ git+https://${GITHUB_TOKEN}@github.com/T1mm1nat0r/mgot_utils.git",
+    "confluent-kafka>=2.12.2",
+    "jaraco-docker>=2.3.0",
+    "numpy>=1.26.0,<2.0.0",
+    "pandas>=2.2.0",
+    "pydantic>=2.12.4",
+    "pytz>=2025.2",
+    "redis>=7.0.1",
+]
