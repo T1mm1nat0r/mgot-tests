@@ -15,4 +15,5 @@ RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 RUN uv sync 
 
 # Set the command to run your application
-CMD ["uv","run", "main.py"]
+ENV MESSAGING_MODE=streams
+CMD ["sh", "-c", "if [ \"$MESSAGING_MODE\" = 'kafka' ]; then uv run main.py; else uv run main_streams.py; fi"]

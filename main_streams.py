@@ -1,102 +1,72 @@
 """
-03_levels_and_zones - Merged service: 03_leveler + 04_zone_updater
+03_levels_and_zones - Level & Zone Processing Service (Redis Streams)
 
 This service:
 1. Processes level achievements (gains/losses) for each bar
 2. Updates zone completion states based on achievements
-3. Passes bar to peaks finder
+3. Passes bar to next service
 
-Optimized for speed with:
-- Fresh Redis pipelines per operation
-- Batch Redis operations
-- Optimized Kafka settings
+Uses Redis Streams + Pub/Sub:
+- Streams for data flow (fast, reliable)
+- Pub/Sub only for processed_bar sync signal
+
+Consumes: stream:clean_candles
+Produces: stream:leveled_and_updated
 """
 
 import os
 import time
-from confluent_kafka import Producer, Consumer
 from mgot_utils import *
 
 
 config = Config()
 
-# Redis - single connection, fresh pipelines per operation
+# Redis connection
 r = connect_to_redis()
+
+# Pub/Sub for processed_bar sync (kept for backward compatibility)
 pub = r.pubsub()
 pub.subscribe('processed_bar')
 
-# Kafka - optimized settings for throughput
-bootstrap = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'redpanda:9092')
-producer_conf = {
-    'bootstrap.servers': bootstrap,
-    'client.id': '03_levels_and_zones-producer',
-    'linger.ms': 5,
-    'batch.num.messages': 100,
-    'queue.buffering.max.kbytes': 32768,
-}
-consumer_conf = {
-    'bootstrap.servers': bootstrap,
-    'group.id': '03_levels_and_zones-group',
-    'auto.offset.reset': 'earliest',
-    'fetch.min.bytes': 1024,
-    'fetch.wait.max.ms': 50,
-}
-
-producer = Producer(producer_conf)
-consumer = Consumer(consumer_conf)
-consumer.subscribe(['clean_candles'])
+# Stream configuration
+STREAM_IN = 'stream:clean_candles'
+STREAM_OUT = 'stream:leveled_and_updated'
+GROUP = '03_levels_and_zones'
+CONSUMER = f'{GROUP}-{os.getpid()}'
 
 
 # =============================================================================
-# LEVEL ACHIEVEMENT PROCESSING (from 03_leveler)
+# LEVEL ACHIEVEMENT PROCESSING
 # =============================================================================
 
 def process_level_achievements(bar: Bar, r) -> tuple[list[str], list[Level]]:
-    """
-    Process level achievements for a bar.
-    
-    Returns:
-        Tuple of (affected_zone_ids, modified_levels) for state logging
-    """
+    """Process level achievements for a bar."""
     pipe = r.pipeline()
     
     time_past_bar = bar.time_of_previous_bar(1)
     current_time = bar.time
 
-    # Identify which levels were breached
     lost_lvl_ids, gained_lvl_ids = bar.identify_achievements(r)
     
-    # Early exit if no achievements
     if not lost_lvl_ids and not gained_lvl_ids:
         return [], []
     
-    # Fetch level objects in batch
     lost_levels = Level.fetch_many(lost_lvl_ids, pipe) if lost_lvl_ids else []
     gained_levels = Level.fetch_many(gained_lvl_ids, pipe) if gained_lvl_ids else []
 
-    # Record events and persist
     record_level_events(lost_levels, gained_levels, time_past_bar, current_time, pipe)
-    
-    # Update tracking lists
     update_tracking_lists(bar, lost_levels, gained_levels, pipe)
-    
-    # Execute all Redis commands in single round-trip
     pipe.execute()
     
-    # Log consecutive events
     log_consecutive_events(lost_levels, gained_levels, current_time)
     
-    # Collect affected zone IDs
     zone_ids = collect_affected_zones(lost_levels, gained_levels)
-    
-    # Return both zone IDs and modified levels for state logging
     all_modified_levels = lost_levels + gained_levels
     return zone_ids, all_modified_levels
 
 
 def record_level_events(lost_levels: list[Level], gained_levels: list[Level], 
                         time_past_bar: int, current_time: int, pipe) -> None:
-    """Record loss/gain events on levels and sync to database."""
     for lvl in lost_levels:
         lvl.record_loss(time_past_bar, current_time)
         lvl.sync_with_db(pipe)
@@ -108,7 +78,6 @@ def record_level_events(lost_levels: list[Level], gained_levels: list[Level],
 
 def update_tracking_lists(bar: Bar, lost_levels: list[Level], 
                           gained_levels: list[Level], pipe) -> None:
-    """Update Redis sorted sets that track which levels to monitor."""
     for lvl in lost_levels:
         lvl.transfer_tracking(pipe, bar.symbol, bar.timeframe, 
                               'to_lose', 'to_gain', lvl.should_stop_tracking_losses())
@@ -120,16 +89,13 @@ def update_tracking_lists(bar: Bar, lost_levels: list[Level],
 
 def log_consecutive_events(lost_levels: list[Level], gained_levels: list[Level], 
                            current_time: int) -> None:
-    """Log levels that had consecutive loss/gain events."""
     for lvl in lost_levels:
         lvl.log_event('loss', current_time)
-    
     for lvl in gained_levels:
         lvl.log_event('gain', current_time)
 
 
 def collect_affected_zones(lost_levels: list[Level], gained_levels: list[Level]) -> list[str]:
-    """Collect unique zone IDs from all affected levels."""
     zone_ids = set()
     for lvl in lost_levels:
         zone_ids.add(lvl.zone_id)
@@ -139,26 +105,16 @@ def collect_affected_zones(lost_levels: list[Level], gained_levels: list[Level])
 
 
 # =============================================================================
-# ZONE UPDATE PROCESSING (from 04_zone_updater)
+# ZONE UPDATE PROCESSING
 # =============================================================================
 
 def process_zone_updates(bar: Bar, affected_zones: list[str], r) -> list[Zone]:
-    """
-    Post-process zones that were affected by this bar's level achievements.
-    Only processes zones that were actually affected.
-    
-    Returns:
-        List of modified Zone objects for state logging
-    """
     if not affected_zones:
         return []
     
     pipe = r.pipeline()
-    
-    # Fetch only affected zones in batch
     zones = Zone.fetch_many(affected_zones, pipe) if affected_zones else []
     
-    # Post-process each zone (updates completion state)
     for zone in zones:
         post_process_zone(bar, zone, r)
     
@@ -170,9 +126,7 @@ def process_zone_updates(bar: Bar, affected_zones: list[str], r) -> list[Zone]:
 # =============================================================================
 
 def sync_with_achiever(bar: Bar) -> None:
-    """
-    Wait for the rest of the pipeline to finish processing this bar.
-    """
+    """Wait for pipeline to finish processing this bar."""
     for message in pub.listen():
         if message['type'] != 'message':
             continue
@@ -183,57 +137,62 @@ def sync_with_achiever(bar: Bar) -> None:
         
         if data == bar.id:
             parts = data.split(':')
-            symbol, timeframe, time = parts[0], parts[1], parts[-1]
-            print(f"processed: {symbol} | {timeframe} | {convert_epoch_to_local(time)}")
+            symbol, timeframe, bar_time = parts[0], parts[1], parts[-1]
+            print(f"processed: {symbol} | {timeframe} | {convert_epoch_to_local(bar_time)}")
             break
 
 
 # =============================================================================
-# MAIN CONSUMER LOOP
+# MAIN CONSUMER
 # =============================================================================
 
-@kafka_consumer(consumer, producer) 
-def main(value, producer):
+def process_bar(value: dict):
+    """Process a single bar through the level/zone pipeline."""
     t_start = time.perf_counter()
     bar = Bar.initiate_bar(value)
     t_init = time.perf_counter()
     
-    # Step 1: Process level achievements (was 03_leveler)
+    # Step 1: Process level achievements
     affected_zone_ids, modified_levels = process_level_achievements(bar, r)
     t_achievements = time.perf_counter()
     
-    # Store achievements on bar - use fresh pipeline
+    # Store achievements on bar
     pipe = r.pipeline()
     bar.achievements = ', '.join(affected_zone_ids) if affected_zone_ids else ''
     bar.sync_with_db(pipe)
     pipe.execute()
     t_bar_sync = time.perf_counter()
     
-    # Step 2: Update zone states (was 04_zone_updater) - only if zones affected
+    # Step 2: Update zone states
     modified_zones = []
     if affected_zone_ids:
         modified_zones = process_zone_updates(bar, affected_zone_ids, r)
     t_zones = time.perf_counter()
     
-    # Log state changes for event sourcing (enables point-in-time state reconstruction)
+    # Log state changes for event sourcing
     if modified_zones or modified_levels:
         log_state_snapshot(r, bar, modified_zones, modified_levels)
     t_log = time.perf_counter()
     
-    # Step 3: Send to next service (04_peaks_and_structures)
-    try:
-        produce_with_retry(producer, 'leveled_and_updated', bar.model_dump_json(), key=bar.id)
-    except Exception as e:
-        print(f'Produce error: {e}')
+    # Step 3: Produce to next service via Redis Stream
+    produce(r, STREAM_OUT, bar.model_dump(mode='json'))
     t_produce = time.perf_counter()
     
     # Wait for pipeline to complete
     sync_with_achiever(bar)
     t_sync_wait = time.perf_counter()
     
-    # Timing report
     print(f'[03 TIMING] {bar.timeframe} | init:{(t_init-t_start)*1000:.1f}ms | achv:{(t_achievements-t_init)*1000:.1f}ms | bar_sync:{(t_bar_sync-t_achievements)*1000:.1f}ms | zones:{(t_zones-t_bar_sync)*1000:.1f}ms | log:{(t_log-t_zones)*1000:.1f}ms | produce:{(t_produce-t_log)*1000:.1f}ms | WAIT:{(t_sync_wait-t_produce)*1000:.1f}ms | TOTAL:{(t_sync_wait-t_start)*1000:.1f}ms')
 
 
+@stream_consumer(r, STREAM_IN, GROUP, CONSUMER)
+def main(value: dict):
+    """Main consumer loop."""
+    process_bar(value)
+
+
 if __name__ == "__main__":
+    print(f"03_levels_and_zones starting...")
+    print(f"Listening on: {STREAM_IN}")
+    print(f"Producing to: {STREAM_OUT}")
     main()
