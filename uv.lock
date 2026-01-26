@@ -173,7 +173,7 @@ wheels = [
 [[package]]
 name = "mgot-utils"
 version = "0.1.2"
-source = { git = "https://github.com/T1mm1nat0r/mgot_utils.git#857d1b209a3e1465dcfa1c10f6e29c9bad20e304" }
+source = { git = "https://github.com/T1mm1nat0r/mgot_utils.git#451e456b30d0806ba6f1e42dcecacdeca23f9051" }
 dependencies = [
     { name = "confluent-kafka" },
     { name = "jaraco-docker" },
