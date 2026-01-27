@@ -79,10 +79,50 @@ def record_level_events(lost_levels: list[Level], gained_levels: list[Level],
     for lvl in lost_levels:
         lvl.record_loss(time_past_bar, current_time)
         lvl.sync_with_db(pipe)
+        
+        # Check if this is a consolidation level - mark consolidation as broken
+        if 'consolidation' in lvl.zone_id:
+            _handle_consolidation_level_loss(lvl, current_time, pipe)
     
     for lvl in gained_levels:
         lvl.record_gain(time_past_bar, current_time)
         lvl.sync_with_db(pipe)
+
+
+def _handle_consolidation_level_loss(level: Level, loss_time: int, pipe) -> None:
+    """
+    Handle when a consolidation level is lost - marks the consolidation breakout.
+    
+    When block_zero (support) is lost = bearish breakout
+    When block_one (resistance) is lost = bullish breakout
+    """
+    from mgot_utils.models import Consolidation
+    
+    consolidation = Consolidation.fetch_by_id(level.zone_id, r)
+    if not consolidation:
+        return
+    
+    # Only process if consolidation is confirmed (not already complete)
+    if consolidation.completion != 'confirmed':
+        return
+    
+    # Determine breakout direction based on which level was lost
+    if level.name == 'block_zero':  # Support lost = bearish
+        consolidation.direction = 0
+        consolidation.broken_level = 'support'
+    elif level.name == 'block_one':  # Resistance lost = bullish
+        consolidation.direction = 1
+        consolidation.broken_level = 'resistance'
+    else:
+        return
+    
+    # Mark as broken
+    consolidation.level_lost = 1  # Use int for Redis compatibility
+    consolidation.level_lost_time = loss_time
+    consolidation.sync_with_db(pipe)
+    
+    print(f'[Consolidation] Level loss detected | {level.zone_id} | '
+          f'Level: {level.name} | Direction: {"UP" if consolidation.direction == 1 else "DOWN"}')
 
 
 def update_tracking_lists(bar: Bar, lost_levels: list[Level], 
