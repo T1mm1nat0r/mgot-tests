@@ -80,21 +80,26 @@ def record_level_events(lost_levels: list[Level], gained_levels: list[Level],
         lvl.record_loss(time_past_bar, current_time)
         lvl.sync_with_db(pipe)
         
-        # Check if this is a consolidation level - mark consolidation as broken
+        # Check if this is a consolidation support level being lost (= support broken downward)
         if 'consolidation' in lvl.zone_id:
-            _handle_consolidation_level_loss(lvl, current_time, pipe)
+            _handle_consolidation_level_break(lvl, current_time, pipe)
     
     for lvl in gained_levels:
         lvl.record_gain(time_past_bar, current_time)
         lvl.sync_with_db(pipe)
 
+        # Check if this is a consolidation resistance level being "gained" (= resistance broken upward)
+        if 'consolidation' in lvl.zone_id:
+            _handle_consolidation_level_break(lvl, current_time, pipe)
 
-def _handle_consolidation_level_loss(level: Level, loss_time: int, pipe) -> None:
+
+def _handle_consolidation_level_break(level: Level, loss_time: int, pipe) -> None:
     """
-    Handle when a consolidation level is lost - marks the consolidation breakout.
-    
-    When block_zero (support) is lost = bearish breakout
-    When block_one (resistance) is lost = bullish breakout
+    Handle when a consolidation level is broken - marks the consolidation breakout.
+
+    Called from both loss and gain paths:
+    - block_zero (support) lost = bearish breakout (from to_lose queue)
+    - block_one (resistance) gained = bullish breakout (from to_gain queue)
     """
     from mgot_utils.models import Consolidation
     
