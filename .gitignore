@@ -4,3 +4,5 @@ compose.local.yaml
 .venv/
 certificates/
 .quix.yaml.variables
+__pycache__/
+*.pyc
