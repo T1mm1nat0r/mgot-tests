@@ -1,0 +1,22 @@
+[
+  [
+    "BTCUSDT:1h:squeeze:1768420800000",
+    "invalid",
+    "1"
+  ],
+  [
+    "BTCUSDT:1h:squeeze:1768575600000",
+    "invalid",
+    "0"
+  ],
+  [
+    "BTCUSDT:1h:squeeze:1768662000000",
+    "taken_out",
+    "1"
+  ],
+  [
+    "BTCUSDT:1h:squeeze:1768788000000",
+    "invalid",
+    "0"
+  ]
+]
