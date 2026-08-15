@@ -29,6 +29,14 @@ recoverable from the hash.
 With both applied, production and replay agree exactly: same zones, same states,
 on 3m/3d, 15m/10d and 1h/20d of BTCUSDT.
 
+**After a deliberate change to detection, this test fails until production is
+reprocessed** — production still holds state computed under the old rules, so
+`test_replay_reproduces_production` is comparing two different detectors. That
+is the intended signal, not a harness regression. `test_replay_is_deterministic`
+and `test_replay_is_warmup_stable` compare the harness only against itself, so
+they keep passing and localise the difference to the detector rather than the
+harness.
+
 Requires the production Redis on 6379; skips without it.
 """
 

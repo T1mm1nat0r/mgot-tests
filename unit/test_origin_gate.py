@@ -141,3 +141,34 @@ def test_blocked_when_previous_origin_completes_after_this_bar():
     last = completed_origin(1) | {'time_completed': str(BAR_TIME + 1)}
     r = make_redis(last_origin=last, prev_zone=unresolved_zone())
     assert origin_gate_open(make_bar(direction=0), r) is False
+
+
+def test_open_when_previous_origin_completes_on_this_very_bar():
+    """Same-bar completion does not block an opposite-direction origin.
+
+    The bar that runs through the previous origin's level is the bar that
+    completes it, and that same bar is what establishes the new structure (TA).
+    The guard is about a previous origin completing in the *future* relative to
+    this peak — which happens because structure is judged two bars behind while
+    completions are written on the current bar — not about the two coinciding.
+
+    Previously `>=`, which discarded this bar silently: it was the one branch in
+    the gate that returned without logging. The missed origin at 2026-07-13
+    00:45 on BTCUSDT 15m is the worked example.
+    """
+    last = completed_origin(1) | {'time_completed': str(BAR_TIME)}
+    r = make_redis(last_origin=last, prev_zone=unresolved_zone())
+    assert origin_gate_open(make_bar(direction=0), r) is True
+
+
+def test_same_bar_completion_still_gated_when_same_direction():
+    """Relaxing the boundary must not bypass the same-direction rule.
+
+    Resolution (a) and (b) need strictly earlier events and (c) needs an
+    opposite mth lost strictly between completion and this bar, so a same-bar
+    completion cannot satisfy any of them — it now blocks with a reason instead
+    of falling through the safety guard silently.
+    """
+    last = completed_origin(0) | {'time_completed': str(BAR_TIME)}
+    r = make_redis(last_origin=last, prev_zone=unresolved_zone())
+    assert origin_gate_open(make_bar(direction=0), r) is False
