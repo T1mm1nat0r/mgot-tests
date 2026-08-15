@@ -187,13 +187,7 @@ def sample_mth_zone() -> dict:
         'mth_value': 50500.0,
         'mth_move_id': '',
         'og_mth_value': 0.0,
-        'age_bars': 0,
-        'touches': 0,
-        'distance_from_price': 0.0,
-        'volume_at_formation': 0.0,
         'state': '',
-        'last_touch_bars_ago': 0,
-        'mtf_alignments': 0,
         'move_id': ''
     }
 
@@ -224,13 +218,7 @@ def sample_origin_zone() -> dict:
         'mth_value': 51000.0,
         'mth_move_id': 'BTCUSDT:1h:move:1699996400000',
         'og_mth_value': 51000.0,
-        'age_bars': 0,
-        'touches': 0,
-        'distance_from_price': 0.0,
-        'volume_at_formation': 0.0,
         'state': '',
-        'last_touch_bars_ago': 0,
-        'mtf_alignments': 0,
         'move_id': 'BTCUSDT:1h:move:1700000000000'
     }
 
