@@ -92,15 +92,34 @@ class Replay:
         # connection to the live keyspace.
         from mgot_utils.core.functions import connect_to_redis
         self.r = connect_to_redis()
-        if self.r.connection_pool.connection_kwargs.get('db') != self.db:
-            raise RuntimeError(
-                f'refusing to run: connected to db '
-                f'{self.r.connection_pool.connection_kwargs.get("db")}, not {self.db}. '
-                'mgot_utils was imported before Replay set REDIS_DB, so the '
-                'connection pool is already bound to the live keyspace.'
-            )
+        self._assert_isolated()
         self._load_services()
         return self
+
+    def _assert_isolated(self) -> None:
+        """Refuse to run unless *everything* points at the replay database.
+
+        Checking `connect_to_redis()` alone is not enough. The services and
+        several mgot_utils modules build an `r` at import time; those hold the
+        pool they were created with, so a pool that was rebound after import
+        would report the right db while `zone_preprocessor.r` still wrote to
+        live state. Each binding is checked directly.
+        """
+        from mgot_utils.processing import zone_preprocessor
+        from mgot_utils.core import functions
+
+        bindings = {'connect_to_redis()': self.r,
+                    'core.functions.r': functions.r,
+                    'zone_preprocessor.r': zone_preprocessor.r}
+        for name, conn in bindings.items():
+            db = conn.connection_pool.connection_kwargs.get('db')
+            if db != self.db:
+                raise RuntimeError(
+                    f'refusing to run: {name} is bound to db {db}, not {self.db}. '
+                    'mgot_utils was imported before Replay set REDIS_DB, so a '
+                    'replay would write into live state. This cannot be fixed '
+                    'in-process — run the harness in its own session.'
+                )
 
     def __exit__(self, *exc):
         for key, value in self._saved_env.items():
@@ -179,19 +198,29 @@ class Replay:
     # -- execution ---------------------------------------------------------
 
     def run(self, progress_every: int = 0) -> int:
-        """Feed every loaded bar through the four stages, in order."""
+        """Feed every loaded bar through the four stages, in order.
+
+        Snapshots are taken **between** stages, not once per bar. Detection
+        decisions read state that a later stage in the same bar then rewrites —
+        `origin_gate_open` reads `last_origin` in 04, and 10 overwrites it when
+        an origin completes on that same bar — so an end-of-bar snapshot shows a
+        value the gate never saw. Answering "what did the detector know when it
+        decided" needs the boundary, not the bar.
+        """
         if not self.bars:
             raise RuntimeError('no bars loaded — call load_from or load_bars')
         for n, bar in enumerate(self.bars, start=1):
+            if self.capture:
+                self._capture(bar, 'start')
             for name, _ in SERVICES:
                 self._modules[name].process_bar(dict(bar))
-            if self.capture:
-                self._capture(bar)
+                if self.capture:
+                    self._capture(bar, f'after_{name}')
             if progress_every and n % progress_every == 0:
                 print(f'  replayed {n}/{len(self.bars)}')
         return len(self.bars)
 
-    def _capture(self, bar: dict) -> None:
+    def _capture(self, bar: dict, stage: str) -> None:
         """Snapshot the state that decided this bar, before the next overwrites it."""
         timeframe, time = bar['timeframe'], int(bar['time'])
         prefix = f'{self.symbol}:{timeframe}'
@@ -210,13 +239,23 @@ class Replay:
         trace.update(zip(TRACKED_STRINGS, result[n_h:n_h + n_s]))
         trace.update(zip(TRACKED_ZSETS, result[n_h + n_s:-1]))
         trace['bar'] = result[-1]
-        self.traces[(timeframe, time)] = trace
+        self.traces.setdefault((timeframe, time), {})[stage] = trace
 
     # -- inspection --------------------------------------------------------
 
-    def trace_at(self, timeframe: str, time: int) -> dict | None:
-        """The decision-relevant state as it stood after `time` was processed."""
-        return self.traces.get((timeframe, int(time)))
+    def trace_at(self, timeframe: str, time: int,
+                 stage: str = 'after_10_zone_processor') -> dict | None:
+        """Decision-relevant state at a stage boundary within `time`.
+
+        Stages are `start`, then `after_<service>` for each of the four. The
+        default is end-of-bar; pass `after_03_levels_and_zones` to see what 04
+        read, which is where the origin gate runs.
+        """
+        return (self.traces.get((timeframe, int(time))) or {}).get(stage)
+
+    def stages_at(self, timeframe: str, time: int) -> dict:
+        """Every stage snapshot for one bar, keyed by stage name."""
+        return self.traces.get((timeframe, int(time))) or {}
 
     def zones(self, timeframe: str, zone_type: str | None = None) -> list[dict]:
         """Every zone the replay produced, oldest first."""
