@@ -249,6 +249,39 @@ class TestTouchStreak:
         assert lvl.touches_without_reachieving() == 0
         assert lvl.third_touch_pending() is False
 
+    def test_both_achievement_paths_reset_the_streak(self):
+        """There are two of them, and only patching one is a silent no-op.
+
+        `Level.record_gain/record_loss` is what 03_levels_and_zones calls;
+        `processing.achievements.gaining_lvl/losing_lvl` is what
+        lvl_preprocessor calls. Patching only the second left touch_streak
+        exactly equal to `tests` on all 1357 levels of a 20-day replay — a
+        field that looks alive and carries no information.
+        """
+        from mgot_utils.models.bar import Bar
+        from mgot_utils.processing.achievements import gaining_lvl, losing_lvl
+
+        lvl = make_level(value=100.0)
+        lvl.record_touch(); lvl.record_touch()
+        lvl.record_gain(time_past_bar=1000, time_current_bar=2000)
+        assert lvl.touch_streak == 0, 'Level.record_gain must reset the streak'
+
+        lvl.record_touch(); lvl.record_touch()
+        lvl.record_loss(time_past_bar=2000, time_current_bar=3000)
+        assert lvl.touch_streak == 0, 'Level.record_loss must reset the streak'
+
+        bar = Bar(id=f'{SYM}:{TF}:bar:4000', symbol=SYM, timeframe=TF, time=4000,
+                  open=105.0, high=110.0, low=104.0, close=106.0, volume=1.0,
+                  direction=1)
+        lvl.record_touch(); lvl.record_touch()
+        gaining_lvl(lvl, bar)
+        assert lvl.touch_streak == 0, 'gaining_lvl must reset the streak'
+
+        bar.close = 95.0
+        lvl.record_touch(); lvl.record_touch()
+        losing_lvl(lvl, bar)
+        assert lvl.touch_streak == 0, 'losing_lvl must reset the streak'
+
     def test_streak_is_separate_from_lifetime_tests(self):
         lvl = make_level(tests=7)
         lvl.record_touch()
