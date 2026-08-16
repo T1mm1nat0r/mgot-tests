@@ -67,22 +67,62 @@ class TestDance:
         dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r)
         state = dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 2000), 2000, r)
         assert state['state'] == dance.STATE_1
+        assert not state.get('pending_ss_id')
 
     def test_full_sequence_to_state_three(self):
+        """1 -> 2untrig -> (candidate) -> 2trig on the higher high -> 3."""
         r = FakeRedis()
         squeeze = make_zone('squeeze', 1, 3000)
-        dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r)
+        dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r, trend_direction=0)
         dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
+        # bounce to A = 105, then the pullback registers the candidate
+        dance.track_bounce(SYM, TF, 105.0, 95.0, 2500, r)
         dance.on_ss_formed(SYM, TF, squeeze, 3000, r)
-        assert dance.read_dance(SYM, TF, r)['state'] == dance.STATE_2_TRIGGERED
+        assert dance.read_dance(SYM, TF, r)['state'] == dance.STATE_2_UNTRIGGERED
+        # a higher high clears A -> confirmed
+        state = dance.confirm_ss(SYM, TF, 106.0, 100.0, 3500, r)
+        assert state['state'] == dance.STATE_2_TRIGGERED
         state = dance.on_ss_broken(SYM, TF, squeeze, 4000, r)
         assert state['state'] == dance.STATE_3
+
+    def test_ss_candidate_does_not_trigger_without_a_higher_high(self):
+        """The SS is confirmed at the higher high, not at the pullback (TA).
+
+        IMAGE 2 enlarged traces low -> high -> higher low -> higher high, and
+        the "SS Created / 2 State = Triggered" callout attaches to the final
+        higher high. Until price clears the first bounce extreme the pullback
+        may be a failed bounce rolling into a new low.
+        """
+        r = FakeRedis()
+        dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r, trend_direction=0)
+        dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
+        dance.track_bounce(SYM, TF, 105.0, 95.0, 2500, r)
+        dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3000), 3000, r)
+        state = dance.read_dance(SYM, TF, r)
+        assert state['state'] == dance.STATE_2_UNTRIGGERED
+        assert state['pending_ss_id']
+        assert float(state['confirm_level']) == 105.0
+        # short of A — still not confirmed
+        state = dance.confirm_ss(SYM, TF, 104.9, 100.0, 3500, r)
+        assert state['state'] == dance.STATE_2_UNTRIGGERED
+
+    def test_bounce_extreme_freezes_once_a_candidate_exists(self):
+        """Otherwise the confirming bar also raises the bar it has to clear."""
+        r = FakeRedis()
+        dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r, trend_direction=0)
+        dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
+        dance.track_bounce(SYM, TF, 105.0, 95.0, 2500, r)
+        dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3000), 3000, r)
+        dance.track_bounce(SYM, TF, 120.0, 95.0, 3200, r)
+        assert float(dance.read_dance(SYM, TF, r)['confirm_level']) == 105.0
 
     def test_a_different_ss_breaking_does_not_advance(self):
         r = FakeRedis()
         dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r)
         dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
+        dance.track_bounce(SYM, TF, 105.0, 95.0, 2500, r)
         dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3000), 3000, r)
+        dance.confirm_ss(SYM, TF, 106.0, 100.0, 3500, r)
         state = dance.on_ss_broken(SYM, TF, make_zone('squeeze', 1, 9999), 4000, r)
         assert state['state'] == dance.STATE_2_TRIGGERED
 
@@ -91,7 +131,9 @@ class TestDance:
         r = FakeRedis()
         dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r)
         dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000, sweep_level=88.0), 2000, r)
+        dance.track_bounce(SYM, TF, 105.0, 95.0, 2500, r)
         dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3000), 3000, r)
+        dance.confirm_ss(SYM, TF, 106.0, 100.0, 3500, r)
         assert dance.read_dance(SYM, TF, r)['state'] == dance.STATE_2_TRIGGERED
 
         state = dance.on_new_extreme(SYM, TF, 80.0, 5000, r)
@@ -112,6 +154,7 @@ class TestDance:
         r = FakeRedis()
         dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r)
         dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
+        dance.track_bounce(SYM, TF, 105.0, 95.0, 2500, r)
         dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3000), 3000, r)
         dance.on_new_extreme(SYM, TF, 80.0, 4000, r)
         state = dance.on_new_mth(SYM, TF, make_zone(direction=0, time=5000), 5000, r)
@@ -129,9 +172,13 @@ class TestDance:
         r = FakeRedis()
         dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r, trend_direction=0)
         dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
-        aligned = dance.on_ss_formed(SYM, TF, make_zone('squeeze', 0, 3000), 3000, r)
-        assert aligned['state'] == dance.STATE_2_UNTRIGGERED, 'trend-aligned SS must not trigger'
-        reversal = dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3100), 3100, r)
+        dance.track_bounce(SYM, TF, 105.0, 95.0, 2500, r)
+        dance.on_ss_formed(SYM, TF, make_zone('squeeze', 0, 3000), 3000, r)
+        assert not dance.read_dance(SYM, TF, r)['pending_ss_id'], \
+            'trend-aligned SS must not even register as a candidate'
+        dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3100), 3100, r)
+        assert dance.read_dance(SYM, TF, r)['pending_ss_id']
+        reversal = dance.confirm_ss(SYM, TF, 106.0, 100.0, 3200, r)
         assert reversal['state'] == dance.STATE_2_TRIGGERED
 
     def test_trend_direction_overrides_the_mth_direction(self):
