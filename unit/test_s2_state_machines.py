@@ -65,12 +65,12 @@ class TestDance:
         """An SS arriving in state 1 triggers nothing — the sweep comes first."""
         r = FakeRedis()
         dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r)
-        state = dance.on_ss_formed(SYM, TF, make_zone('squeeze', 0, 2000), 2000, r)
+        state = dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 2000), 2000, r)
         assert state['state'] == dance.STATE_1
 
     def test_full_sequence_to_state_three(self):
         r = FakeRedis()
-        squeeze = make_zone('squeeze', 0, 3000)
+        squeeze = make_zone('squeeze', 1, 3000)
         dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r)
         dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
         dance.on_ss_formed(SYM, TF, squeeze, 3000, r)
@@ -82,8 +82,8 @@ class TestDance:
         r = FakeRedis()
         dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r)
         dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
-        dance.on_ss_formed(SYM, TF, make_zone('squeeze', 0, 3000), 3000, r)
-        state = dance.on_ss_broken(SYM, TF, make_zone('squeeze', 0, 9999), 4000, r)
+        dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3000), 3000, r)
+        state = dance.on_ss_broken(SYM, TF, make_zone('squeeze', 1, 9999), 4000, r)
         assert state['state'] == dance.STATE_2_TRIGGERED
 
     def test_new_low_demotes_the_two(self):
@@ -91,7 +91,7 @@ class TestDance:
         r = FakeRedis()
         dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r)
         dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000, sweep_level=88.0), 2000, r)
-        dance.on_ss_formed(SYM, TF, make_zone('squeeze', 0, 3000), 3000, r)
+        dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3000), 3000, r)
         assert dance.read_dance(SYM, TF, r)['state'] == dance.STATE_2_TRIGGERED
 
         state = dance.on_new_extreme(SYM, TF, 80.0, 5000, r)
@@ -112,11 +112,34 @@ class TestDance:
         r = FakeRedis()
         dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r)
         dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
-        dance.on_ss_formed(SYM, TF, make_zone('squeeze', 0, 3000), 3000, r)
+        dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3000), 3000, r)
         dance.on_new_extreme(SYM, TF, 80.0, 4000, r)
         state = dance.on_new_mth(SYM, TF, make_zone(direction=0, time=5000), 5000, r)
         assert state['state'] == dance.STATE_1
         assert state['demotions'] == 0
+
+    def test_a_trend_aligned_ss_does_not_trigger(self):
+        """The trigger SS points at the reversal, not along the trend (TA).
+
+        IMAGE 2 marks "SS Created / 2 State = Triggered" on an *upward* swing in
+        a down 15m trend; IMAGE 17 the same. Measured against the leg chain,
+        74-79% of detected squeezes run with the leg, so accepting any of them
+        triggers on the wrong three quarters.
+        """
+        r = FakeRedis()
+        dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r, trend_direction=0)
+        dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
+        aligned = dance.on_ss_formed(SYM, TF, make_zone('squeeze', 0, 3000), 3000, r)
+        assert aligned['state'] == dance.STATE_2_UNTRIGGERED, 'trend-aligned SS must not trigger'
+        reversal = dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3100), 3100, r)
+        assert reversal['state'] == dance.STATE_2_TRIGGERED
+
+    def test_trend_direction_overrides_the_mth_direction(self):
+        """The dance tracks the trend, not whichever MTH happened to reset it."""
+        r = FakeRedis()
+        state = dance.on_new_mth(SYM, TF, make_zone(direction=1), 1000, r,
+                                 trend_direction=0)
+        assert int(state['direction']) == 0
 
     def test_permits_table_matches_the_spec(self):
         assert dance.permits(dance.STATE_2_UNTRIGGERED) == 'nothing'
