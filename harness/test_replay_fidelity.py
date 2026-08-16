@@ -63,17 +63,26 @@ TIMED = [('time_completed', 'time_completed'),
 
 # `zone_tests` and `sweeps` count within the zone's **current lifecycle phase**,
 # not over its lifetime — crossing complete -> taken_out resets them, along with
-# `test_eligible_time`. So they are only comparable when both sides sit in the
-# same phase. If production was taken out after the window, its counters have
-# already been reset by an event the replay has not seen, and the pre-takeout
-# values are not recoverable from the hash. Those zones are compared on
-# lifecycle only.
+# `test_eligible_time`.
 #
-# Worth knowing beyond this test: read straight out of Redis these look like
+# The two are not equally recoverable, which an earlier version of this file got
+# wrong. `Zone.mark_taken_out` copies the complete-phase test data into
+# `complete_zone_tests` before resetting, so a zone production took out after
+# the window can still be compared: production's `complete_zone_tests` is what
+# the replay's `zone_tests` should hold. `sweeps` has no such backup and is
+# genuinely lost, so it is the only field dropped on a phase change.
+#
+# Worth knowing beyond this test: read straight out of Redis both look like
 # lifetime counters, and anything treating them as such — a feature extractor,
 # for instance — silently undercounts every zone that changed phase.
 PHASE_SCOPED = [('zone_tests', 'last_zone_test_time'),
                 ('sweeps', 'last_sweep_time')]
+
+# Phase-scoped field -> (preserved count, preserved timestamp), where one
+# exists. The timestamp matters as much as the count: a preserved test that
+# happened after the window is still future information and has to roll back
+# exactly like a live one.
+PRESERVED = {'zone_tests': ('complete_zone_tests', 'complete_zone_test_time')}
 
 # Zones formed this close to the window end may still be in flight — MTH zones
 # are confirmed by later moves, squeezes by a parent MTH completing.
@@ -115,6 +124,14 @@ def _phase_changed_after(zone, end):
         or int(zone.get('time_completed') or 0) > end
 
 
+def _as_of_count(zone, field, stamp, end) -> str:
+    """A counter, zeroed when the event behind it happened after the window."""
+    happened = int(zone.get(stamp) or 0)
+    if happened and happened > end:
+        return '0'
+    return str(int(zone.get(field) or 0))
+
+
 def _as_of(zone, end, phase_scoped=True):
     """The zone as it stood at `end`, with later state changes rolled back."""
     completed = int(zone.get('time_completed') or 0)
@@ -133,14 +150,24 @@ def _as_of(zone, end, phase_scoped=True):
         state[field] = '0' if (happened and happened > end) \
             else str(int(zone.get(field) or 0))
 
-    # Two separate corrections, both needed. A counter whose event is simply
-    # later than the window gets rolled back; a counter the zone reset by
-    # changing phase cannot be rolled back at all, and is dropped.
-    if phase_scoped:
-        for field, stamp in PHASE_SCOPED:
-            happened = int(zone.get(stamp) or 0)
-            state[field] = '0' if (happened and happened > end) \
-                else str(int(zone.get(field) or 0))
+    # Two separate corrections. A counter whose event is simply later than the
+    # window is rolled back. A counter reset by a phase change is read from its
+    # preserved copy where one exists, and dropped where none does.
+    for field, stamp in PHASE_SCOPED:
+        if phase_scoped:
+            state[field] = _as_of_count(zone, field, stamp, end)
+            continue
+        backup = PRESERVED.get(field)
+        if backup is None:
+            # `sweeps` has no backup — genuinely lost on a phase change.
+            continue
+        # Either copy may hold the count depending on which side of the phase
+        # boundary the zone sits on, and each rolls back against its own stamp.
+        # Redis hands back strings, and '0' is truthy, so coerce before the
+        # fallback or a preserved zero silently wins over a live count.
+        preserved = int(_as_of_count(zone, backup[0], backup[1], end))
+        current = int(_as_of_count(zone, field, stamp, end))
+        state[field] = str(preserved or current)
     return state
 
 
