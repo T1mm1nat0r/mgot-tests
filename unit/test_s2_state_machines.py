@@ -36,16 +36,31 @@ def make_level(name='block_zero', value=100.0, direction=1, **kw):
 
 
 class FakeRedis:
-    """Hash-only stand-in — the dance stores a single hash per timeframe."""
+    """Hashes plus a sorted set — the dance keeps state *and* a transition index."""
 
     def __init__(self):
         self.hashes = {}
+        self.zsets = {}
 
     def hgetall(self, key):
         return dict(self.hashes.get(key, {}))
 
     def hset(self, key, mapping=None, **kw):
         self.hashes.setdefault(key, {}).update(mapping or {})
+
+    def zadd(self, key, mapping):
+        self.zsets.setdefault(key, {}).update(mapping)
+
+    def zrangebyscore(self, key, lo, hi):
+        items = sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1])
+        return [m for m, sc in items
+                if (lo == '-inf' or sc >= lo) and (hi == '+inf' or sc <= hi)]
+
+    def transitions(self, symbol, timeframe):
+        """States recorded, oldest first — what the chart would draw."""
+        idx = self.zsets.get(f'{symbol}:{timeframe}:dance_index', {})
+        return [self.hashes[m]['state'] for m in
+                sorted(idx, key=lambda k: idx[k]) if m in self.hashes]
 
 
 # ── The dance ────────────────────────────────────────────────
@@ -187,6 +202,21 @@ class TestDance:
         state = dance.on_new_mth(SYM, TF, make_zone(direction=1), 1000, r,
                                  trend_direction=0)
         assert int(state['direction']) == 0
+
+    def test_state_changes_are_recorded_for_the_chart(self):
+        """Only *state* changes land in the index — not every bounce update.
+
+        `dance_state` holds what is true now, so without the index there is
+        nothing to draw and nothing to audit after the fact.
+        """
+        r = FakeRedis()
+        dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r, trend_direction=0)
+        dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
+        dance.track_bounce(SYM, TF, 105.0, 95.0, 2500, r)
+        dance.track_bounce(SYM, TF, 108.0, 95.0, 2600, r)
+        dance.on_ss_formed(SYM, TF, make_zone('squeeze', 1, 3000), 3000, r)
+        dance.confirm_ss(SYM, TF, 109.0, 100.0, 3500, r)
+        assert r.transitions(SYM, TF) == ['1', '2_untriggered', '2_triggered']
 
     def test_permits_table_matches_the_spec(self):
         assert dance.permits(dance.STATE_2_UNTRIGGERED) == 'nothing'
