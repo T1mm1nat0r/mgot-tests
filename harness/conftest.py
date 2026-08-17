@@ -35,6 +35,8 @@ def pytest_collection_modifyitems(config, items):
         f'mgot_utils is already bound to db {pool.connection_kwargs.get("db")}; '
         'the replay would write to live state. Run "pytest harness/" on its own.'
     ))
+    # Every test under harness/ drives a Replay, so every one of them is unsafe
+    # here — naming a single file would leave a later module unguarded, which is
+    # the same omission this hook exists to prevent.
     for item in items:
-        if str(item.fspath).endswith('test_replay_fidelity.py'):
-            item.add_marker(skip)
+        item.add_marker(skip)
