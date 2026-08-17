@@ -359,6 +359,47 @@ class TestTouchStreak:
         assert lvl.touch_streak == 1
 
 
+# ── Leg direction ────────────────────────────────────────────
+
+class TestOpenLegDirection:
+    """An open leg must not default to bearish.
+
+    `leg_at_time` returns the *last* leg, which is normally the open one, so an
+    open leg that always read as direction 0 made the trend look permanently
+    down — the dance spent 2019 bars in a down state against 16 up on 15m while
+    the legs themselves were 30 up to 32 down.
+    """
+
+    def _origin(self, direction, mth_value, time=1000):
+        return Zone(id=f'{SYM}:{TF}:origin:{time}', symbol=SYM, timeframe=TF,
+                    type='origin', direction=direction, time=time,
+                    process_time=time + 900000, mth_value=mth_value,
+                    mth_move_id=f'{SYM}:{TF}:move:{time}',
+                    block_zero=mth_value, block_one=mth_value + 10)
+
+    def test_open_leg_from_a_bullish_origin_travels_down(self):
+        from mgot_utils.processing.legs import _leg_from_pair
+        start = self._origin(1, 100.0)
+        leg = _leg_from_pair(start, None, {start.id: 1000})
+        assert leg.complete == 0
+        assert leg.direction == 0
+
+    def test_open_leg_from_a_bearish_origin_travels_up(self):
+        from mgot_utils.processing.legs import _leg_from_pair
+        start = self._origin(0, 100.0)
+        leg = _leg_from_pair(start, None, {start.id: 1000})
+        assert leg.complete == 0
+        assert leg.direction == 1, 'an open leg must not default to bearish'
+
+    def test_closed_leg_direction_still_comes_from_price(self):
+        from mgot_utils.processing.legs import _leg_from_pair
+        start = self._origin(1, 100.0, 1000)
+        end = self._origin(0, 120.0, 2000)
+        leg = _leg_from_pair(start, end, {start.id: 1000, end.id: 2000})
+        assert leg.complete == 1
+        assert leg.direction == 1
+
+
 # ── Market profile sweep policy ──────────────────────────────
 
 class TestSweepPolicy:
