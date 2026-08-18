@@ -430,6 +430,67 @@ class TestOpenLegDirection:
         assert leg.direction == 1
 
 
+# ── State 1: the with-trend SS ───────────────────────────────
+
+class TestStateOneSetup:
+    """State 1 permits the regular trade, and something must surface it.
+
+    Adv 2.3.1: "Here you primarily want to look for shorts at SS's if they are
+    provided, as we are still expecting an Origin or low to be swept". Roughly
+    three quarters of detected squeezes run with the trend, and until this landed
+    `PERMITS[STATE_1]` named a trade nothing produced.
+    """
+
+    def _in_state_1(self, r, trend=0, extreme=100.0):
+        mth = make_zone(direction=trend, time=1000, sweep_level=extreme)
+        dance.on_new_mth(SYM, TF, mth, 1000, r, trend_direction=trend)
+        return r
+
+    def test_state_1_expects_a_sweep(self):
+        from mgot_utils.processing import expectation
+        r = self._in_state_1(FakeRedis())
+        ex = expectation.from_dance(SYM, TF, 2000, r)
+        assert ex is not None
+        assert ex.rule == 'dance_1_expect_sweep'
+        assert ex.target == 100.0
+        assert ex.direction == 0, 'a bearish trend expects its low swept'
+
+    def test_untriggered_expects_nothing(self):
+        """"Sit on your hands" — naming a target here would invent one."""
+        from mgot_utils.processing import expectation
+        r = self._in_state_1(FakeRedis())
+        dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
+        assert expectation.from_dance(SYM, TF, 3000, r) is None
+
+    def test_candidates_are_empty_outside_state_1(self):
+        from mgot_utils.processing import expectation
+        r = self._in_state_1(FakeRedis())
+        dance.on_sweep(SYM, TF, make_zone('origin', 0, 2000), 2000, r)
+        assert expectation.with_trend_candidates(SYM, TF, r) == []
+
+    def test_candidates_run_with_the_trend_and_are_live(self):
+        from unittest.mock import MagicMock
+        from mgot_utils.processing import expectation
+        fake = self._in_state_1(FakeRedis(), trend=0)
+        aligned = make_zone('squeeze', 0, 3000, completion='complete', mth_value=90.0)
+        reversal = make_zone('squeeze', 1, 3100, completion='complete', mth_value=90.0)
+        spent = make_zone('squeeze', 0, 3200, completion='taken_out', mth_value=90.0)
+
+        r = MagicMock()
+        r.hgetall.side_effect = lambda k: fake.hgetall(k)
+        r.zrevrangebyscore.return_value = [aligned.id, reversal.id, spent.id]
+        pipe = MagicMock()
+        pipe.execute.return_value = [z.model_dump(mode='json')
+                                     for z in (aligned, reversal, spent)]
+        r.pipeline.return_value = pipe
+
+        out = expectation.with_trend_candidates(SYM, TF, r)
+        ids = [c['squeeze_id'] for c in out]
+        assert aligned.id in ids
+        assert reversal.id not in ids, 'reversal-ward SS is the 2 trigger, not the state-1 trade'
+        assert spent.id not in ids, 'a taken-out SS is spent, not tradeable'
+
+
 # ── Market profile sweep policy ──────────────────────────────
 
 class TestSweepPolicy:
