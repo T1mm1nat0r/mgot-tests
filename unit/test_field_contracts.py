@@ -362,7 +362,11 @@ def test_origin_gate_reads_only_real_zone_fields():
 # by convention. `potential_secondary` is written by
 # `04_peaks_and_structure.process_pso` and read only by `console_tools`, which
 # pulls it straight out of the hash, so the names happen to match today.
-UNDECLARED_BAR_FIELDS = {'potential_secondary'}
+# Empty as of 2026-08-18: `potential_secondary` was declared on Bar, which is
+# what this ledger existed to prompt. Keep the set — an empty ledger that fails
+# on the *first* re-divergence is the whole point, and is stricter than deleting
+# the test once it happens to pass.
+UNDECLARED_BAR_FIELDS: set[str] = set()
 
 
 def test_no_new_undeclared_fields_appear_on_bar_hashes():
