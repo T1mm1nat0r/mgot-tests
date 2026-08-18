@@ -255,3 +255,82 @@ def test_latest_mth_skips_incomplete_zones():
 
 def test_latest_mth_returns_none_on_an_empty_index():
     assert ar.latest_mth('BTCUSDT', '15m', 1, QueueingFake()) is None
+
+
+# ── §4 touch counting, read off the same level ───────────────────
+
+class LevelFake:
+    """A Level stand-in carrying the two fields `current` reads."""
+
+    def __init__(self, value, touch_streak=0, conseq_gain=0, conseq_loss=0):
+        self.value, self.touch_streak = value, touch_streak
+        self.conseq_gain, self.conseq_loss = conseq_gain, conseq_loss
+
+    def third_touch_pending(self):
+        return (self.touch_streak or 0) >= 2
+
+
+class RefFake(QueueingFake):
+    """`current` also calls zone.fetch_lvls(pipe); serve a fixed level set."""
+
+    def __init__(self, levels):
+        super().__init__()
+        self._levels = levels
+
+
+def _current_with(monkeypatch, zone_levels, mth, ss=None):
+    r = RefFake(zone_levels)
+    _put(r, mth)
+    if ss is not None:
+        r.hset(ss.id, mapping=ss.model_dump(exclude_none=True, mode='json'))
+    monkeypatch.setattr(Zone, 'fetch_lvls', lambda self, pipe, execute=True: zone_levels)
+    return ar.current('BTCUSDT', '15m', int(mth.direction), r)
+
+
+def test_current_reports_touches_from_the_bottomside_level(monkeypatch):
+    mth = make_zone(direction=1, time=1700000900000, completion='complete',
+                    block_zero=49000.0, block_one=50000.0, zone_tests=1)
+    levels = [LevelFake(49000.0, touch_streak=2), LevelFake(50000.0, touch_streak=9)]
+
+    ref = _current_with(monkeypatch, levels, mth)
+
+    assert ref['touches'] == 2, 'read the wrong level — 9 is the topside'
+    assert ref['third_touch_pending'] is True
+
+
+def test_third_touch_not_pending_below_two(monkeypatch):
+    mth = make_zone(direction=1, time=1700000900000, completion='complete',
+                    block_zero=49000.0, block_one=50000.0)
+    ref = _current_with(monkeypatch, [LevelFake(49000.0, touch_streak=1)], mth)
+
+    assert ref['touches'] == 1
+    assert ref['third_touch_pending'] is False
+
+
+def test_touches_follow_the_handover(monkeypatch):
+    """Once the SS takes over, the count must come from the SS's bottomside.
+
+    Counting on the dead MTH's level after handover is the failure this pins:
+    both reads succeed, and the dance is described against a zone the method has
+    already moved on from.
+    """
+    mth = make_zone(direction=1, time=1700000900000, completion='taken_out',
+                    block_zero=49000.0, block_one=50000.0)
+    ss = make_zone(ztype='squeeze', direction=1, time=1700000900000,
+                   completion='taken_out', block_zero=47000.0, block_one=48000.0)
+    ss_levels = [LevelFake(47000.0, touch_streak=2), LevelFake(48000.0)]
+
+    ref = _current_with(monkeypatch, ss_levels, mth, ss)
+
+    assert ref['role'] == 'ss' and ref['handed_over'] == 1
+    assert ref['level'] == 47000.0
+    assert ref['touches'] == 2
+
+
+def test_missing_bottomside_level_reports_zero_touches(monkeypatch):
+    mth = make_zone(direction=1, time=1700000900000, completion='complete',
+                    block_zero=49000.0, block_one=50000.0)
+    ref = _current_with(monkeypatch, [LevelFake(50000.0, touch_streak=7)], mth)
+
+    assert ref['touches'] == 0
+    assert ref['third_touch_pending'] is False
