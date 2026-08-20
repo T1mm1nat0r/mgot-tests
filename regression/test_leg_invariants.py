@@ -150,3 +150,35 @@ def test_chained_origins_do_not_collapse_leg_endpoints_onto_one_price():
     )
     assert endpoints & {round(v, 2) for v in own}, \
         'leg endpoints do not use the origins own MTH extremes'
+
+
+def test_start_time_and_start_mth_time_describe_the_same_move():
+    """`refresh_legs` bounds its delete by one and its gather by the other.
+
+    If they describe different moves the rebuild writes legs outside the range
+    it cleared, laying new legs alongside stale ones. Before the fix,
+    `start_mth_time` followed the chain anchor backwards: measured on 3m the two
+    bounds came apart by 888 minutes and 6 of 10 rebuilt legs landed before the
+    deletion window.
+    """
+    own, original = 1700009000000, 1700001000000
+    origins = [
+        _origin(1700009000000, 1, own, 100.0),
+        _origin(1700016000000, 0, 1700016000000, 90.0),
+    ]
+    r = FakeRedis({
+        f'BTCUSDT:15m:move:{own}': {'time': str(own), 'length_bar': '2',
+                                    'og_mth_move_id': f'BTCUSDT:15m:move:{original}'},
+        f'BTCUSDT:15m:move:{original}': {'time': str(original), 'length_bar': '2'},
+        'BTCUSDT:15m:move:1700016000000': {'time': '1700016000000', 'length_bar': '2'},
+    })
+    turns = legs.turning_points(origins, '15m', r)
+
+    leg = legs._chain(origins, turns, None)[0]
+
+    assert leg.start_mth_time == own, (
+        f'start_mth_time is {leg.start_mth_time}, not the origin own MTH move '
+        f'{own} — it followed the chain anchor back to {original}'
+    )
+    # and it must precede the turning point, which is one bar past that move
+    assert leg.start_mth_time <= leg.start_time
