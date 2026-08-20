@@ -182,3 +182,78 @@ def test_start_time_and_start_mth_time_describe_the_same_move():
     )
     # and it must precede the turning point, which is one bar past that move
     assert leg.start_mth_time <= leg.start_time
+
+
+# ── extending an ending through a continuing sequence (TA, 2026-08-20) ──
+
+def _o(t, direction, mth_value):
+    return _origin(t, direction, t, mth_value)
+
+
+def _turns_for(times):
+    return FakeRedis({f'BTCUSDT:15m:move:{t}': {'time': str(t), 'length_bar': '2'}
+                      for t in times})
+
+
+def test_higher_high_extends_a_bearish_origin_ending():
+    """"higher for bearish" — trade-side naming: a bearish origin is a sell zone
+    at a high (stored direction=1), so a higher one is a higher high and the leg
+    reaches further up."""
+    times = [1700002000000, 1700009000000, 1700016000000]
+    origins = [_o(times[0], 0, 90.0), _o(times[1], 1, 110.0), _o(times[2], 1, 115.0)]
+    assert legs._extend_ending(origins, 1) == 2
+
+
+def test_lower_low_extends_a_bullish_origin_ending():
+    """"lower for bullish" — a bullish origin is a buy zone at a low (stored
+    direction=0); a lower one is a lower low."""
+    times = [1700002000000, 1700009000000, 1700016000000]
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0), _o(times[2], 0, 85.0)]
+    assert legs._extend_ending(origins, 1) == 2
+
+
+def test_extension_always_carries_the_leg_further_in_its_own_direction():
+    """The whole point. Reading direction as stored inverts both tests and every
+    extension then pulls the endpoint back toward the start."""
+    times = [1700002000000, 1700009000000, 1700016000000]
+    # bullish-origin ending (stored 0, a low): a *higher* low must NOT extend
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0), _o(times[2], 0, 95.0)]
+    assert legs._extend_ending(origins, 1) == 1
+    # bearish-origin ending (stored 1, a high): a *lower* high must NOT extend
+    origins = [_o(times[0], 0, 90.0), _o(times[1], 1, 110.0), _o(times[2], 1, 105.0)]
+    assert legs._extend_ending(origins, 1) == 1
+
+
+def test_an_opposite_direction_neighbour_stops_the_walk():
+    times = [1700002000000, 1700009000000, 1700016000000]
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0), _o(times[2], 1, 85.0)]
+    assert legs._extend_ending(origins, 1) == 1
+
+
+def test_the_walk_continues_across_several():
+    times = [1700002000000, 1700009000000, 1700016000000, 1700023000000]
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0),
+               _o(times[2], 0, 85.0), _o(times[3], 0, 80.0)]
+    assert legs._extend_ending(origins, 1) == 3
+
+
+def test_extending_never_moves_the_ending_backwards():
+    """The leg must still not end before it starts — the invariant from the
+    17 Aug regression has to survive this rule."""
+    times = [1700002000000, 1700009000000, 1700016000000]
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0), _o(times[2], 0, 85.0)]
+    r = _turns_for(times)
+    turns = legs.turning_points(origins, '15m', r)
+    for leg in legs._chain(origins, turns, extend=True):
+        if leg.end_time:
+            assert leg.end_time >= leg.start_time
+
+
+def test_extend_can_be_switched_off():
+    times = [1700002000000, 1700009000000, 1700016000000]
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0), _o(times[2], 0, 85.0)]
+    r = _turns_for(times)
+    turns = legs.turning_points(origins, '15m', r)
+    off = legs._chain(origins, turns, extend=False)[0]
+    on = legs._chain(origins, turns, extend=True)[0]
+    assert on.extreme != off.extreme
