@@ -51,10 +51,27 @@ class FakeRedis:
     def zadd(self, key, mapping):
         self.zsets.setdefault(key, {}).update(mapping)
 
-    def zrangebyscore(self, key, lo, hi):
+    def zrangebyscore(self, key, lo, hi, start=0, num=None):
+        """Supports the exclusive `(bound` form and start/num, like the real one.
+
+        Both are used by production code — `_first_mth_after` asks for the first
+        MTH strictly after a time — so a fake without them fails on argument
+        shape rather than on behaviour, which hides real bugs.
+        """
+        def bound(v, default_lo):
+            if isinstance(v, str) and v.startswith('('):
+                return float(v[1:]), True
+            if v in ('-inf', '+inf'):
+                return (float('-inf') if v == '-inf' else float('inf')), False
+            return float(v), False
+
+        lo_v, lo_ex = bound(lo, True)
+        hi_v, hi_ex = bound(hi, False)
         items = sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1])
-        return [m for m, sc in items
-                if (lo == '-inf' or sc >= lo) and (hi == '+inf' or sc <= hi)]
+        out = [m for m, sc in items
+               if (sc > lo_v if lo_ex else sc >= lo_v)
+               and (sc < hi_v if hi_ex else sc <= hi_v)]
+        return out[start:start + num] if num is not None else out[start:]
 
     def transitions(self, symbol, timeframe):
         """States recorded, oldest first — what the chart would draw."""
@@ -607,3 +624,83 @@ class TestSweepLevelTakenDirection:
 
     def test_missing_zone_is_not_taken(self):
         assert s2._sweep_level_taken(f'{SYM}:{TF}:mth:404', FakeRedis()) is False
+
+
+# ── Trend confirmation retires an SS (TA, 2026-08-20) ────────
+
+class TestTrendConfirmationRetiresSS:
+    """"if after the identification of an SS, a mth was followed by an origin
+    and that origin was tested, then remove the ss."
+
+    Deliberately forward-looking. The rule deleted on 2026-08-17 walked
+    *backwards* from the triggering MTH to any recent same-direction origin, so
+    it killed squeezes for events that predated them — 69 of 103 on 15m.
+    """
+
+    def _world(self, r, *, tested_wick=0, entered=0, make_origin=True,
+               mth_time=2000, ss_time=1000):
+        sq = make_zone(zone_type='squeeze', direction=0, time=ss_time)
+        r.hset(sq.id, mapping=sq.model_dump(exclude_none=True, mode='json'))
+        move = f'{SYM}:{TF}:move:{mth_time}'
+        r.hset(f'{SYM}:{TF}:mth:{mth_time}', mapping={
+            'id': f'{SYM}:{TF}:mth:{mth_time}', 'type': 'mth', 'time': mth_time,
+            'move_id': move, 'direction': 0})
+        r.zadd(f'{SYM}:{TF}:mth_index', {f'{SYM}:{TF}:mth:{mth_time}': mth_time})
+        if make_origin:
+            oid = f'{SYM}:{TF}:origin:{mth_time + 100}'
+            r.hset(oid, mapping={'id': oid, 'type': 'origin', 'time': mth_time + 100,
+                                 'mth_move_id': move, 'direction': 0,
+                                 'zone_tests': tested_wick, 'entry_count': entered})
+            r.zadd(f'{SYM}:{TF}:zones_index', {oid: mth_time + 100})
+        return sq
+
+    def test_wick_test_of_the_origin_retires_the_ss(self):
+        r = FakeRedis()
+        sq = self._world(r, tested_wick=1)
+        assert ss_invalidation.trend_confirmed_against(sq, r) is not None
+
+    def test_entry_into_the_origin_also_retires_it(self):
+        """"if price enters the origin without taking out the origin thats
+        alright too" — entry is the more common half (366 vs 294 on 1m)."""
+        r = FakeRedis()
+        sq = self._world(r, entered=2)
+        assert ss_invalidation.trend_confirmed_against(sq, r) is not None
+
+    def test_untouched_origin_leaves_the_ss_alone(self):
+        r = FakeRedis()
+        sq = self._world(r, tested_wick=0, entered=0)
+        assert ss_invalidation.trend_confirmed_against(sq, r) is None
+
+    def test_mth_that_produced_no_origin_leaves_the_ss_alone(self):
+        """The commonest outcome by far — 96 of 131 squeezes on 15m."""
+        r = FakeRedis()
+        sq = self._world(r, make_origin=False)
+        assert ss_invalidation.trend_confirmed_against(sq, r) is None
+
+    def test_an_origin_predating_the_ss_cannot_retire_it(self):
+        """The exact failure of the deleted rule: it reached backwards."""
+        r = FakeRedis()
+        sq = self._world(r, tested_wick=1, ss_time=5000, mth_time=2000)
+        assert ss_invalidation.trend_confirmed_against(sq, r) is None, \
+            'an MTH before the SS was used to retire it'
+
+    def test_only_the_first_mth_after_the_ss_counts(self):
+        """One candidate per SS. "any tested origin ever" killed 453 of 454."""
+        r = FakeRedis()
+        sq = self._world(r, tested_wick=0, entered=0, mth_time=2000)
+        # a later MTH whose origin *was* tested must not rescue the rule
+        r.hset(f'{SYM}:{TF}:mth:9000', mapping={
+            'id': f'{SYM}:{TF}:mth:9000', 'type': 'mth', 'time': 9000,
+            'move_id': f'{SYM}:{TF}:move:9000', 'direction': 0})
+        r.zadd(f'{SYM}:{TF}:mth_index', {f'{SYM}:{TF}:mth:9000': 9000})
+        oid = f'{SYM}:{TF}:origin:9100'
+        r.hset(oid, mapping={'id': oid, 'type': 'origin', 'time': 9100,
+                             'mth_move_id': f'{SYM}:{TF}:move:9000',
+                             'direction': 0, 'zone_tests': 5, 'entry_count': 0})
+        r.zadd(f'{SYM}:{TF}:zones_index', {oid: 9100})
+        assert ss_invalidation.trend_confirmed_against(sq, r) is None
+
+    def test_non_squeeze_zones_are_untouched(self):
+        r = FakeRedis()
+        self._world(r, tested_wick=1)
+        assert ss_invalidation.trend_confirmed_against(make_zone(zone_type='mth'), r) is None
