@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 from mgot_utils.core.configs import Config, MarketProfile, StockProfile
 from mgot_utils.models import Level, Zone
-from mgot_utils.processing import dance, ss_invalidation, tensk
+from mgot_utils.processing import dance, s2, ss_invalidation, tensk
 
 SYM, TF = 'BTCUSDT', '15m'
 
@@ -508,3 +508,102 @@ class TestSweepPolicy:
     def test_relaxed_profile_falls_back_when_the_body_is_unknown(self):
         profile = StockProfile(Config().delta_epoch)
         assert profile.sweep_threshold(100.0, None) == 100.0
+
+
+# ── Sweep level taken resets the dance (TA, 2026-08-20) ──────
+
+class TestSweepLevelTakenResets:
+    """"Once a sweep level is gained, the dance is reset." (TA)
+
+    A sweep is a wick through a level that closes back inside. A *close* through
+    that same level means it was taken, not swept, so the 2 has nothing left to
+    reverse away from. Distinct from a demotion, which keeps the 2 and moves its
+    reference — here the level that defined the 2 is gone.
+    """
+
+    def _in_two(self, r, direction=0):
+        dance.on_new_mth(SYM, TF, make_zone(direction=direction), 1000, r,
+                         trend_direction=direction)
+        dance.on_sweep(SYM, TF, make_zone(direction=direction), 2000, r)
+        return dance.read_dance(SYM, TF, r)
+
+    def test_resets_from_two_untriggered(self):
+        r = FakeRedis()
+        assert self._in_two(r)['state'] == dance.STATE_2_UNTRIGGERED
+
+        state = dance.on_sweep_level_taken(SYM, TF, 3000, r)
+
+        assert state['state'] == dance.STATE_1
+        assert state['reset_reason'] == 'sweep_level_taken'
+        assert state['swept_zone_id'] == ''
+        assert state['pending_ss_id'] == ''
+
+    def test_keeps_the_trend_direction(self):
+        """The trend did not change — only the sweep turned out not to be one."""
+        r = FakeRedis()
+        self._in_two(r, direction=1)
+        state = dance.on_sweep_level_taken(SYM, TF, 3000, r)
+        assert int(state['direction']) == 1
+
+    def test_clears_the_demotion_count(self):
+        r = FakeRedis()
+        self._in_two(r, direction=0)
+        dance.on_new_extreme(SYM, TF, 1.0, 2500, r)
+        assert int(dance.read_dance(SYM, TF, r)['demotions']) >= 1
+
+        state = dance.on_sweep_level_taken(SYM, TF, 3000, r)
+        assert int(state['demotions']) == 0
+
+    def test_is_a_noop_in_state_one(self):
+        """Nothing was swept, so there is no sweep level to lose."""
+        r = FakeRedis()
+        dance.on_new_mth(SYM, TF, make_zone(direction=0), 1000, r, trend_direction=0)
+        before = dance.read_dance(SYM, TF, r)
+
+        after = dance.on_sweep_level_taken(SYM, TF, 3000, r)
+        assert after['state'] == before['state'] == dance.STATE_1
+        assert after.get('reset_reason', '') == ''
+
+    def test_records_a_transition(self):
+        """It must land in dance_index or the reset is invisible to any chart."""
+        r = FakeRedis()
+        self._in_two(r)
+        dance.on_sweep_level_taken(SYM, TF, 3000, r)
+        assert r.transitions(SYM, TF)[-1] == dance.STATE_1
+
+
+class TestSweepLevelTakenDirection:
+    """The taking direction is asymmetric, and getting it wrong fires always."""
+
+    def _zone_with(self, r, level, block_zero, block_one, gains=0, losses=0):
+        zid = f'{SYM}:{TF}:mth:1000'
+        r.hset(zid, mapping={'id': zid, 'symbol': SYM, 'timeframe': TF, 'type': 'mth',
+                             'direction': 0, 'completion': 'complete', 'time': 1000,
+                             'process_time': 1900, 'block_zero': block_zero,
+                             'block_one': block_one, 'sweep_level': level})
+        r.hset(f'{zid}:sweep_level', mapping={'gains': gains, 'losses': losses})
+        return zid
+
+    def test_level_below_the_block_is_taken_by_a_loss(self):
+        r = FakeRedis()
+        zid = self._zone_with(r, level=90.0, block_zero=100.0, block_one=95.0, losses=1)
+        assert s2._sweep_level_taken(zid, r) is True
+
+    def test_level_below_the_block_is_not_taken_by_a_gain(self):
+        """A low is closed above on most bars; counting that resets constantly."""
+        r = FakeRedis()
+        zid = self._zone_with(r, level=90.0, block_zero=100.0, block_one=95.0, gains=5)
+        assert s2._sweep_level_taken(zid, r) is False
+
+    def test_level_above_the_block_is_taken_by_a_gain(self):
+        r = FakeRedis()
+        zid = self._zone_with(r, level=110.0, block_zero=100.0, block_one=105.0, gains=1)
+        assert s2._sweep_level_taken(zid, r) is True
+
+    def test_level_above_the_block_is_not_taken_by_a_loss(self):
+        r = FakeRedis()
+        zid = self._zone_with(r, level=110.0, block_zero=100.0, block_one=105.0, losses=5)
+        assert s2._sweep_level_taken(zid, r) is False
+
+    def test_missing_zone_is_not_taken(self):
+        assert s2._sweep_level_taken(f'{SYM}:{TF}:mth:404', FakeRedis()) is False
