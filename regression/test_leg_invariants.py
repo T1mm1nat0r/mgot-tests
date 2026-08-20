@@ -113,3 +113,40 @@ def test_chain_start_times_are_monotonic():
     starts = [l.start_time for l in legs._chain(origins, turns, None)]
 
     assert starts == sorted(starts), f'chain order does not follow time: {starts}'
+
+
+def test_chained_origins_do_not_collapse_leg_endpoints_onto_one_price():
+    """A chain is repeated retries of one structure, so `og_mth_value` is shared.
+
+    Using it as the leg endpoint therefore froze many legs onto the same two
+    prices. Over 8-9 Jul 2026 on 15m the window ran 61,544.56 to 63,761.99 while
+    the legs bounced between 62,888.35 and 61,329.98 — the latter below the
+    window's own low. Nine completed origins shared one `og_mth_value`.
+
+    The endpoint is the origin's own MTH extreme, which is distinct per origin.
+    """
+    times = [1700002000000, 1700009000000, 1700016000000]
+    shared = 55000.0                       # what a chain would all point at
+    own = [61883.73, 62336.01, 61608.14]   # their real, distinct extremes
+    origins = [
+        _origin(t, i % 2, t, own[i], og_mth_value=shared,
+                og_move='BTCUSDT:15m:move:1700000000000')
+        for i, t in enumerate(times)
+    ]
+    r = FakeRedis({f'BTCUSDT:15m:move:{t}': {'time': str(t), 'length_bar': '2'}
+                   for t in times})
+    turns = legs.turning_points(origins, '15m', r)
+
+    chain = legs._chain(origins, turns, None)
+
+    endpoints = set()
+    for leg in chain:
+        endpoints.add(round(leg.origin_extreme, 2))
+        if leg.complete:
+            endpoints.add(round(leg.extreme, 2))
+    assert shared not in endpoints, (
+        'leg endpoints resolved to the shared chain anchor; every leg in a '
+        'chain collapses onto one price'
+    )
+    assert endpoints & {round(v, 2) for v in own}, \
+        'leg endpoints do not use the origins own MTH extremes'
