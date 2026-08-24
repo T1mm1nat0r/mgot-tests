@@ -399,8 +399,8 @@ def test_s2_reads_only_dance_fields_the_dance_writes():
     """The dance's state dict is its whole interface to the S2 driver.
 
     `dance_state` has no model either. `s2.advance` steers on
-    `state`, `direction`, `pending_ss_id`, `entered_at` and `trigger_zone_id`;
-    a field the dance stopped writing reads back as None, and `on_ss_broken`
+    `state`, `direction`, `pending_iss_id`, `entered_at` and `trigger_zone_id`;
+    a field the dance stopped writing reads back as None, and `on_iss_broken`
     would simply never fire — which is how state 3 stayed unreachable across the
     whole dataset once before.
     """
