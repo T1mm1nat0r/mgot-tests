@@ -209,8 +209,35 @@ class FakeRedis:
 
 
 class FakeBar:
-    def __init__(self, move_id):
+    """A bar as `03_levels_and_zones` actually sees one.
+
+    It carries `move_id` because **`02_timeframe_creator` assigns it**, upstream
+    of the 03 seam this classifier hangs on (2026-08-25).
+
+    That was not always true. Move assignment used to live in 04, one service
+    *after* 03, so 03's bar had no `move_id` at all — and this fake supplied one
+    anyway, which is why the classifier's dependency on a field it never had in
+    production went unnoticed until a 55-day reprocess produced zero failures
+    against 56 in replay. The fake is only honest now because the pipeline
+    changed; if move assignment ever moves back downstream of 03, this fake
+    becomes a lie again.
+    """
+
+    def __init__(self, move_id, time=0, direction=1,
+                 symbol='BTCUSDT', timeframe='15m'):
         self.move_id = move_id
+        self.time = time
+        self.direction = direction
+        self.symbol = symbol
+        self.timeframe = timeframe
+
+
+def _bar_in(move, offset_bars=0, delta=900000):
+    """A bar inside `move`, carrying the move id 02 would have assigned."""
+    return FakeBar(move_id=move.id,
+                   time=int(move.time) + offset_bars * delta,
+                   direction=int(move.direction),
+                   symbol=move.symbol, timeframe=move.timeframe)
 
 
 def _seed(r, *moves):
@@ -225,7 +252,7 @@ def test_classify_creates_the_failure():
     expansion = make_move(direction=1, time=1700002700000, high=53000.0, low=50000.0)
     _seed(r, retrace, expansion)
 
-    zone = failures.classify(FakeBar(expansion.id), make_origin(), r)
+    zone = failures.classify(_bar_in(expansion), make_origin(), r)
 
     assert zone is not None
     assert zone.id == 'BTCUSDT:15m:failure:1700000000000'
@@ -243,7 +270,7 @@ def test_classify_is_idempotent():
     retrace = make_move(direction=0, time=1700000000000, high=51000.0, low=50000.0)
     expansion = make_move(direction=1, time=1700002700000, high=53000.0, low=50000.0)
     _seed(r, retrace, expansion)
-    bar, origin = FakeBar(expansion.id), make_origin()
+    bar, origin = _bar_in(expansion), make_origin()
 
     first = failures.classify(bar, origin, r)
     second = failures.classify(bar, origin, r)
@@ -264,7 +291,7 @@ def test_only_origins_and_failures_confirm_a_failure(zone_type):
     other = make_origin()
     other.type = zone_type
 
-    assert failures.classify(FakeBar(expansion.id), other, r) is None
+    assert failures.classify(_bar_in(expansion), other, r) is None
 
 
 def test_classify_needs_a_preceding_move():
@@ -273,10 +300,16 @@ def test_classify_needs_a_preceding_move():
     expansion = make_move(direction=1, time=1700002700000, high=53000.0, low=50000.0)
     _seed(r, expansion)
 
-    assert failures.classify(FakeBar(expansion.id), make_origin(), r) is None
+    assert failures.classify(_bar_in(expansion), make_origin(), r) is None
+
 
 
 def test_classify_without_a_move_id_does_nothing():
+    """A bar with no move cannot name an expansion.
+
+    Live this means 02 has not assigned one — a cold start or a gap. Refusing is
+    right; the alternative is guessing which move a bar belongs to.
+    """
     assert failures.classify(FakeBar(''), make_origin(), FakeRedis()) is None
 
 
