@@ -73,11 +73,59 @@ class FakeRedis:
                and (sc < hi_v if hi_ex else sc <= hi_v)]
         return out[start:start + num] if num is not None else out[start:]
 
+    def hmget(self, key, fields):
+        """Field projection — production screens with this before a full read."""
+        h = self.hashes.get(key, {})
+        return [h.get(f) for f in fields]
+
+    def zrevrange(self, key, start, end):
+        items = sorted(self.zsets.get(key, {}).items(),
+                       key=lambda kv: kv[1], reverse=True)
+        return [m for m, _ in items][start:end + 1]
+
+    def get(self, key):
+        return self.strings.get(key) if hasattr(self, 'strings') else None
+
+    def set(self, key, value):
+        if not hasattr(self, 'strings'):
+            self.strings = {}
+        self.strings[key] = value
+        return True
+
+    def pipeline(self, transaction=True):
+        """A queue that replays onto this same fake on `execute`.
+
+        The hot paths batch their reads rather than issuing one call per id, so
+        a fake without `pipeline` fails on argument shape and hides whether the
+        batched version actually returns the same thing.
+        """
+        return FakePipeline(self)
+
     def transitions(self, symbol, timeframe):
         """States recorded, oldest first — what the chart would draw."""
         idx = self.zsets.get(f'{symbol}:{timeframe}:dance_index', {})
         return [self.hashes[m]['state'] for m in
                 sorted(idx, key=lambda k: idx[k]) if m in self.hashes]
+
+
+class FakePipeline:
+    """Queues calls against a FakeRedis and returns their results in order."""
+
+    def __init__(self, parent: 'FakeRedis'):
+        self._parent = parent
+        self._queued = []
+
+    def __getattr__(self, name):
+        def queue(*args, **kwargs):
+            self._queued.append((name, args, kwargs))
+            return self
+        return queue
+
+    def execute(self):
+        results = [getattr(self._parent, name)(*args, **kwargs)
+                   for name, args, kwargs in self._queued]
+        self._queued.clear()
+        return results
 
 
 # ── The dance ────────────────────────────────────────────────

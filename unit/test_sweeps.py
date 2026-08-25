@@ -132,32 +132,84 @@ class TestSweepDetection:
         assert result is True
         assert zone.sweeps == 1
 
-    def test_sweep_only_if_not_gained_lost(self):
-        """For MTH zones: sweep level already gained/lost → no sweep."""
+    def test_low_sweep_level_is_spent_by_a_loss(self):
+        """A low is consumed by being *lost* — a close below it — so no sweep."""
         zone = make_zone(
-            type='mth',
-            direction=0,
-            sweep_level=49200.0,
-            block_zero=49500.0,
-            block_one=50500.0,
+            type='mth', direction=0,
+            sweep_level=49200.0, block_zero=49500.0, block_one=50500.0,
         )
-        # Sweep level has already been gained
-        sweep_lvl = make_level(zone.id, 'sweep_level', 49200.0, gains=1)
         lvls = [
             make_level(zone.id, 'block_zero', 49500.0),
             make_level(zone.id, 'block_one', 50500.0),
-            sweep_lvl,
+            make_level(zone.id, 'sweep_level', 49200.0, losses=1),
         ]
-        pipe = MagicMock()
-
-        bar = make_bar(
-            open=50000.0, close=49600.0,
-            low=49100.0, high=50200.0,
-            direction=0,
-        )
-        result = _check_and_record_sweep(bar, zone, lvls, pipe)
-        assert result is False
+        bar = make_bar(open=50000.0, close=49600.0, low=49100.0, high=50200.0,
+                       direction=0)
+        assert _check_and_record_sweep(bar, zone, lvls, MagicMock()) is False
         assert zone.sweeps == 0
+
+    def test_low_sweep_level_is_not_spent_by_a_gain(self):
+        """The asymmetry, pinned — this has been got wrong twice.
+
+        A low sits *below* the block, so price closes above it on almost every
+        bar. Treating those gains as spending it rejected every MTH sweep in the
+        dataset once already. Only a close *below* consumes a low.
+
+        This case previously asserted the opposite and still passed, because a
+        separate bar-direction clause rejected it for an unrelated reason. That
+        clause was removed on 2026-08-25 and the mis-specification surfaced.
+        """
+        zone = make_zone(
+            type='mth', direction=0,
+            sweep_level=49200.0, block_zero=49500.0, block_one=50500.0,
+        )
+        lvls = [
+            make_level(zone.id, 'block_zero', 49500.0),
+            make_level(zone.id, 'block_one', 50500.0),
+            make_level(zone.id, 'sweep_level', 49200.0, gains=1),
+        ]
+        bar = make_bar(open=50000.0, close=49600.0, low=49100.0, high=50200.0,
+                       direction=0)
+        assert _check_and_record_sweep(bar, zone, lvls, MagicMock()) is True
+        assert zone.sweeps == 1
+
+    def test_high_sweep_level_is_spent_by_a_gain(self):
+        """The mirror: a high is consumed by a close *above* it."""
+        zone = make_zone(
+            type='mth', direction=1,
+            sweep_level=50800.0, block_zero=50500.0, block_one=49500.0,
+        )
+        lvls = [
+            make_level(zone.id, 'block_zero', 50500.0),
+            make_level(zone.id, 'block_one', 49500.0),
+            make_level(zone.id, 'sweep_level', 50800.0, gains=1),
+        ]
+        bar = make_bar(open=50000.0, close=50400.0, low=49900.0, high=50900.0,
+                       direction=1)
+        assert _check_and_record_sweep(bar, zone, lvls, MagicMock()) is False
+        assert zone.sweeps == 0
+
+    def test_a_down_bar_can_sweep_a_low(self):
+        """No bar-direction restriction on MTH sweeps (2026-08-25).
+
+        Driving through a low and closing back above it is *by nature* a down
+        bar. The removed clause demanded the sweeping bar oppose the direction
+        the level was last tested from, which asked for a shape that mostly
+        cannot occur — it suppressed 30 of 54 MTH sweeps on 15m over July and
+        misdated others by up to 409 bars.
+        """
+        zone = make_zone(
+            type='mth', direction=0,
+            sweep_level=49200.0, block_zero=49500.0, block_one=50500.0,
+        )
+        lvls = [
+            make_level(zone.id, 'block_zero', 49500.0),
+            make_level(zone.id, 'block_one', 50500.0),
+            make_level(zone.id, 'sweep_level', 49200.0),
+        ]
+        bar = make_bar(open=50000.0, close=49600.0, low=49100.0, high=50200.0,
+                       direction=0)
+        assert _check_and_record_sweep(bar, zone, lvls, MagicMock()) is True
 
     def test_sweep_requires_wick_outside_zone(self):
         """Wick must extend beyond zone boundary for sweep to register."""
