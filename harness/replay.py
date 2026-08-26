@@ -268,7 +268,15 @@ class Replay:
         """
         if not self.bars:
             raise RuntimeError('no bars loaded — call load_from or load_bars')
+        from mgot_utils.core.configs import Config
+        detect = set(Config().detect_timeframes)
         for n, bar in enumerate(self.bars, start=1):
+            # 02 stores a bar outside `detect_timeframes` but never emits it, so
+            # the chain never sees one. Replaying it here would exercise a path
+            # production does not have — the same class of divergence that let
+            # the failure classifier read a field 03 never carries.
+            if bar.get('timeframe') not in detect:
+                continue
             if self.capture:
                 self._capture(bar, 'start')
             payload = self._supply(bar)

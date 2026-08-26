@@ -324,3 +324,67 @@ def test_previous_move_excludes_the_expansion_itself():
 
     got = failures._previous_move(expansion, r)
     assert got is not None and got.id == retrace.id
+
+
+# ── the seam: one failure per zone, at the moment it is lost ─────────
+
+def _lost_zone(completion, tf='15m'):
+    z = make_origin(tf)
+    z.completion = completion
+    return z
+
+
+def _seeded(r):
+    retrace = make_move(direction=0, time=1700000000000, high=51000.0, low=50000.0)
+    expansion = make_move(direction=1, time=1700002700000, high=53000.0, low=50000.0)
+    _seed(r, retrace, expansion)
+    return _bar_in(expansion)
+
+
+def test_a_failure_is_minted_when_the_zone_is_lost():
+    """TA 2026-08-26: one failure per origin, the one that lost it."""
+    r = FakeRedis(); bar = _seeded(r)
+    zone = _lost_zone('taken_out')
+    assert failures.on_zone_processed(bar, zone, [], r, 'complete') is not None
+
+
+def test_invalid_also_counts_as_lost():
+    """`invalid` is block_zero achieved before completion — price went through
+    it just the same, so it is a loss, not a different outcome."""
+    r = FakeRedis(); bar = _seeded(r)
+    zone = _lost_zone('invalid')
+    assert failures.on_zone_processed(bar, zone, [], r, 'incomplete') is not None
+
+
+def test_completing_is_not_losing():
+    """`complete` is the zone doing its job — the opposite of a failure."""
+    r = FakeRedis(); bar = _seeded(r)
+    zone = _lost_zone('complete')
+    assert failures.on_zone_processed(bar, zone, [], r, 'incomplete') is None
+
+
+def test_a_zone_already_lost_does_not_mint_again():
+    """The transition is the event. Re-processing a zone that was already lost
+    is not a second failure — that repetition is what produced 398 failures
+    across 49% of all moves before this rule."""
+    r = FakeRedis(); bar = _seeded(r)
+    zone = _lost_zone('taken_out')
+    assert failures.on_zone_processed(bar, zone, [], r, 'taken_out') is None
+
+
+def test_levels_are_no_longer_consulted():
+    """Achievement of a level recurs; losing the zone does not. Passing no
+    levels at all must still mint the failure, which pins that the trigger
+    moved off the level entirely."""
+    r = FakeRedis(); bar = _seeded(r)
+    zone = _lost_zone('taken_out')
+    assert failures.on_zone_processed(bar, zone, [], r, 'complete') is not None
+
+
+@pytest.mark.parametrize('zone_type', ['mth', 'squeeze', 'structure'])
+def test_only_origins_and_failures_can_be_lost_into_a_failure(zone_type):
+    """MTHs are taken out constantly; Adv 3.1 names origins and failures."""
+    r = FakeRedis(); bar = _seeded(r)
+    zone = _lost_zone('taken_out')
+    zone.type = zone_type
+    assert failures.on_zone_processed(bar, zone, [], r, 'complete') is None
