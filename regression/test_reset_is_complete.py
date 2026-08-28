@@ -78,6 +78,7 @@ CLEANED_VIA_INDEX = {
     'move': 'sorted:moves',
     'leg': 'legs_index',
     'dance': 'dance_index',
+    'ss_level': 'ss_levels_index',
 }
 
 # Suffixes hanging off a zone id that are *not* Redis keys — they are members of
