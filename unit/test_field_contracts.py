@@ -76,7 +76,7 @@ HSET_HANDOFFS = [
         'utils/src/mgot_utils/processing/squeeze.py', 'zone.id', 'completion',
         'Zone', 'utils/src/mgot_utils/processing/s2.py',
         "('invalid', 'absorbed')",
-        id='completion=absorbed: expand_base -> Zone -> s2 SS candidate scan',
+        id='completion=absorbed: expand_block -> Zone -> s2 SS candidate scan',
     ),
 ]
 

@@ -78,7 +78,6 @@ CLEANED_VIA_INDEX = {
     'move': 'sorted:moves',
     'leg': 'legs_index',
     'dance': 'dance_index',
-    'ss_level': 'ss_levels_index',
 }
 
 # Suffixes hanging off a zone id that are *not* Redis keys — they are members of
@@ -179,7 +178,7 @@ def _seed(r, symbol):
         zset(f'{p}:mth_index', {mth_id: T, absorbed_id: T + 1})
 
         for zone_id in (origin_id, mth_id, squeeze_id, absorbed_id):
-            for name in ('block_zero', 'block_one', 'block_half', 'sweep_level'):
+            for name in ('block_zero', 'block_one', 'block_half', 'sweep_level', 'ss_level'):
                 level_id = f'{zone_id}:{name}'
                 hash_key(level_id, {'id': level_id, 'value': 1.0})
                 zset(f'{level_id}:log', {'event': T})

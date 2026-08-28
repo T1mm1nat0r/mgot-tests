@@ -1,5 +1,12 @@
 """
-The secondary-swing level is taken from the two candles at the turn — and only those.
+The secondary-swing level: taken from the two candles at the turn, tracked as a Level.
+
+Rebuilt 2026-08-28 (TA). It was briefly its own `SSLevel` model with its own
+index, open set and per-bar hook in `10_zone_processor` — a parallel copy of
+machinery `Level` already had. `sweep_level` was the standing precedent: a named
+extra level on the MTH zone. So the level now rides `get_lvl_ids` ->
+`create_lvls` -> the existing `to_gain`/`to_lose` queues, and "tested" is
+`Level.is_untested()` rather than a second definition.
 
 Before 2026-08-27 the squeeze base came from `prev_move.open`, a move boundary,
 while `_find_base_candle` swept the *whole* range from the previous move's start
@@ -20,13 +27,10 @@ old base range in 99.8% of cases — so this tightens the base rather than movin
 it somewhere else.
 """
 
-import json
-from types import SimpleNamespace
-
 import pytest
 
-from mgot_utils.models import Bar, Move, Zone, SSLevel
-from mgot_utils.processing import ss_levels
+from mgot_utils.models import Bar, Level, Move, Zone
+from mgot_utils.processing.lvl_preprocessor import _get_level_test_params
 from mgot_utils.processing.squeeze import _turn_base_level
 
 
@@ -179,196 +183,87 @@ def test_returns_none_when_the_bars_are_missing():
 
 
 # ============================================================
-# TESTED / UNTESTED
+# TESTED / UNTESTED — Level.is_untested
 # ============================================================
 
-def a_level(direction=0, value=111.0, move_id='mth-move'):
-    return SSLevel(id=SSLevel.build_id(SYMBOL, TF, T0), symbol=SYMBOL, timeframe=TF,
-                   direction=direction, value=value, time=T0, mth_move_id=move_id)
+def a_level(direction, tests=0, gains=0, losses=0):
+    return Level(id=f'{SYMBOL}:{TF}:mth:{T0}:ss_level', zone_id=f'{SYMBOL}:{TF}:mth:{T0}',
+                 name='ss_level', direction=direction, value=111.0,
+                 tests=tests, gains=gains, losses=losses)
 
 
-def test_a_wick_touch_counts_as_a_test():
-    # level above (direction 0); the bar's high just reaches it
-    assert a_level().is_test(a_bar(4, high=111.0, low=105.0, close=108.0)) is True
+def test_a_fresh_level_is_untested():
+    assert a_level(0).is_untested() is True
+    assert a_level(1).is_untested() is True
 
 
-def test_a_wick_touch_is_not_a_close_beyond():
-    """A wick reaches the level; it does not close through it."""
-    level, bar = a_level(), a_bar(4, high=111.5, low=105.0, close=109.0)
-    assert level.is_test(bar) is True
-    assert level.is_close_beyond(bar) is False
-    level.register_bar(bar)
-    assert (level.tested, level.fakeouts, level.achieved) == (1, 0, 0)
+def test_a_wick_touch_makes_it_tested():
+    assert a_level(0, tests=1).is_untested() is False
+    assert a_level(1, tests=1).is_untested() is False
 
 
-def test_one_close_beyond_is_unresolved_not_a_grade():
-    """Until the next bar it is neither a fakeout nor an achievement."""
-    level = a_level()
-    level.register_bar(a_bar(4, high=120.0, low=105.0, close=115.0))
-    assert level.pending_close_at == T0 + 4 * DELTA
-    assert (level.fakeouts, level.achieved) == (0, 0)
-    assert level.is_tradeable() is True
-    assert level.is_settled() is False, 'a single close must not retire the level'
+def test_a_close_on_the_returning_side_makes_it_tested():
+    # direction 0: the move went down, so the level sits above — a close ABOVE
+    # it is price coming back, which Level counts as a gain.
+    assert a_level(0, gains=1).is_untested() is False
+    # direction 1: mirrored, the level sits below and a close below is the return
+    assert a_level(1, losses=1).is_untested() is False
 
 
-def test_close_beyond_then_directly_back_inside_is_a_fakeout():
-    """TA, 2026-08-28: 'a single close above and a close below directly'."""
-    level = a_level()
-    level.register_bar(a_bar(4, high=120.0, low=105.0, close=115.0))
-    level.register_bar(a_bar(5, high=118.0, low=104.0, close=108.0))
+def test_closes_on_the_departed_side_are_ignored():
+    """The regression this rule exists for.
 
-    assert level.fakeouts == 1
-    assert level.last_fakeout_at == T0 + 5 * DELTA
-    assert level.pending_close_at == 0
-    assert level.achieved == 0
-    assert level.is_tradeable() is True, 'a fakeout must not retire the level'
-
-
-def test_two_consecutive_closes_achieve_and_take_it_out():
-    level = a_level()
-    level.register_bar(a_bar(4, high=120.0, low=105.0, close=115.0))
-    level.register_bar(a_bar(5, high=121.0, low=112.0, close=116.0))
-
-    assert level.achieved == 1
-    assert level.achieved_at == T0 + 5 * DELTA
-    assert level.fakeouts == 0
-    assert level.is_taken_out() is True
-    assert level.is_tradeable() is False, 'an achieved level is taken out'
-    assert level.is_settled() is True
-
-
-def test_a_gap_between_closes_is_not_an_achievement():
-    """Two closes beyond that are not consecutive leave the level alive."""
-    level = a_level()
-    level.register_bar(a_bar(4, high=120.0, low=105.0, close=115.0))
-    level.register_bar(a_bar(5, high=112.0, low=104.0, close=106.0))   # back inside
-    level.register_bar(a_bar(6, high=120.0, low=105.0, close=115.0))
-
-    assert level.closes_beyond == 2
-    assert level.conseq_close_beyond == 1
-    assert level.achieved == 0
-    assert level.fakeouts == 1
-    assert level.is_tradeable() is True
-
-
-def test_a_wick_after_a_close_beyond_is_not_a_fakeout():
-    """The fakeout needs a *close* back inside, not merely a bar that failed to close beyond.
-
-    Guard against the pending marker surviving to match a later, unrelated bar.
+    A level the market left downward sits above price, so *every* later close is
+    a "loss". Counting both sides would mark it tested on the very next bar and
+    make untested levels vanish entirely.
     """
-    level = a_level()
-    level.register_bar(a_bar(4, high=120.0, low=105.0, close=115.0))
-    level.register_bar(a_bar(9, high=118.0, low=104.0, close=108.0))   # not adjacent
-    assert level.fakeouts == 0
-    assert level.pending_close_at == 0, 'stale pending marker left to match later'
-
-
-def test_grades_are_addressable_by_name():
-    level = a_level()
-    level.register_bar(a_bar(4, high=120.0, low=105.0, close=115.0))
-    assert level.has_reached('tested') is True
-    assert level.has_reached('achieved') is False
-    assert level.reached_at('tested') == T0 + 4 * DELTA
-    with pytest.raises(ValueError):
-        # a single close beyond is unresolved, so it is not a grade
-        level.has_reached('closed_beyond')
-
-
-def test_falling_short_is_not_a_test():
-    assert a_level().is_test(a_bar(4, high=110.9, low=105.0)) is False
-
-
-def test_the_move_away_does_not_test_its_own_level():
-    """Its bars start at the level, so counting them would test everything at once."""
-    bar = a_bar(4, high=115.0, low=105.0, move_id='mth-move')
-    assert a_level(move_id='mth-move').is_test(bar) is False
-
-
-def test_a_bar_at_or_before_the_turn_does_not_test():
-    assert a_level().is_test(a_bar(0, high=200.0, low=100.0)) is False
-
-
-def test_an_already_tested_level_is_not_retested():
-    level = a_level()
-    level.tested = 1
-    assert level.is_test(a_bar(4, high=200.0, low=100.0)) is False
-
-
-def test_a_move_to_high_level_is_tested_from_above():
-    level = a_level(direction=1, value=111.0)
-    assert level.is_test(a_bar(4, high=120.0, low=111.0)) is True
-    assert level.is_test(a_bar(4, high=120.0, low=111.1)) is False
+    assert a_level(0, losses=9).is_untested() is True, 'losses below a level above price are not a test'
+    assert a_level(1, gains=9).is_untested() is True, 'gains above a level below price are not a test'
 
 
 # ============================================================
-# THE REGISTRY
+# IT IS A REAL LEVEL ON THE ZONE
 # ============================================================
 
-def test_a_tested_level_stays_open_until_it_is_achieved():
-    """Dropping it at the first touch would make achievement unobservable."""
-    r = FakeRedis()
-    ss_levels.register(a_zone(0), value=111.0, candle_time=T0, mth_move_id='m1', r=r)
-    key = ss_levels.open_key(SYMBOL, TF)
-
-    changed = ss_levels.record_bar(a_bar(4, high=111.5, low=105.0, close=109.0, move_id='m2'), r)
-    assert [lvl.value for lvl in changed] == [111.0]
-    assert changed[0].tested_at == T0 + 4 * DELTA
-    assert len(r.hgetall(key)) == 1, 'a merely tested level must stay open'
-    assert r.hgetall(SSLevel.build_id(SYMBOL, TF, T0))['tested'] == '1'
-
-    # two consecutive closes beyond retire it
-    ss_levels.record_bar(a_bar(5, high=120.0, low=105.0, close=115.0, move_id='m2'), r)
-    assert len(r.hgetall(key)) == 1, 'one close is not an achievement'
-    ss_levels.record_bar(a_bar(6, high=121.0, low=112.0, close=116.0, move_id='m2'), r)
-    assert r.hgetall(key) == {}, 'achieved level left in the open set'
-    assert r.hgetall(SSLevel.build_id(SYMBOL, TF, T0))['achieved'] == '1'
+def an_mth(direction=0, ss=111.0):
+    return Zone(id=f'{SYMBOL}:{TF}:mth:{T0}', symbol=SYMBOL, timeframe=TF, type='mth',
+                direction=direction, time=T0, process_time=T0 + 2 * DELTA,
+                block_zero=120.0, block_one=100.0, ss_level=ss,
+                move_end_time=T0 + DELTA)
 
 
-def test_untested_ignores_a_level_already_touched():
-    r = FakeRedis()
-    ss_levels.register(a_zone(0), value=111.0, candle_time=T0, mth_move_id='m1', r=r)
-    assert len(ss_levels.untested(SYMBOL, TF, r)) == 1
-
-    ss_levels.record_bar(a_bar(4, high=111.5, low=105.0, close=109.0, move_id='m2'), r)
-
-    assert ss_levels.untested(SYMBOL, TF, r) == []
-    # ...but by the stricter grade it is still outstanding
-    assert len(ss_levels.untested(SYMBOL, TF, r, grade='achieved')) == 1
+def test_the_zone_declares_it_as_a_level():
+    assert f'{SYMBOL}:{TF}:mth:{T0}:ss_level' in an_mth().get_lvl_ids()
 
 
-def test_untested_orders_by_time_and_filters_by_direction():
-    r = FakeRedis()
-    for i, direction in [(3, 0), (1, 1), (2, 0)]:
-        ss_levels.register(SimpleNamespace(symbol=SYMBOL, timeframe=TF, direction=direction,
-                                           id=f'{SYMBOL}:{TF}:mth:{T0 + i * DELTA}'),
-                           value=100.0 + i, candle_time=T0 + i * DELTA, mth_move_id='m', r=r)
-
-    assert [lvl.time for lvl in ss_levels.untested(SYMBOL, TF, r)] == [
-        T0 + DELTA, T0 + 2 * DELTA, T0 + 3 * DELTA]
-    assert [lvl.value for lvl in ss_levels.untested(SYMBOL, TF, r, direction=0)] == [102.0, 103.0]
+def test_no_level_when_the_turn_could_not_be_read():
+    assert not any(i.endswith(':ss_level') for i in an_mth(ss=0).get_lvl_ids())
 
 
-def test_as_of_recovers_what_was_untested_at_a_past_bar():
-    """A level tested later was still open then — `tested_at` makes that recoverable.
+def test_block_zero_and_block_one_keep_positions_0_and_1():
+    """`update_mth` and `update_squeeze` read `zone_lvls[0]` and `[1]` positionally.
 
-    The open set only knows the present, so S4 cannot ask it this question.
+    Inserting the new level rather than appending it would silently hand zone
+    completion the wrong level.
     """
-    r = FakeRedis()
-    zone = a_zone(0)
-    ss_levels.register(zone, value=111.0, candle_time=T0, mth_move_id='m1', r=r)
-    ss_levels.record_bar(a_bar(8, high=115.0, low=105.0, close=109.0, move_id='m2'), r)
-
-    assert ss_levels.untested(SYMBOL, TF, r) == []          # tested by now
-    later = [lvl.time for lvl in ss_levels.untested(SYMBOL, TF, r, as_of=T0 + 4 * DELTA)]
-    assert later == [T0], 'lost the fact that it was open four bars earlier'
-    # and it is not open before it existed
-    assert ss_levels.untested(SYMBOL, TF, r, as_of=T0) == []
+    ids = an_mth().get_lvl_ids()
+    assert ids[0].endswith(':block_zero')
+    assert ids[1].endswith(':block_one')
 
 
-def test_register_is_idempotent_across_a_reprocess():
-    """The id comes from the turn candle's time, so a second pass overwrites."""
-    r = FakeRedis()
-    zone = a_zone(0)
-    for _ in range(2):
-        ss_levels.register(zone, value=111.0, candle_time=T0, mth_move_id='m1', r=r)
-    assert len(r.hgetall(ss_levels.open_key(SYMBOL, TF))) == 1
+def test_an_origin_gets_no_ss_level():
+    origin = Zone(id=f'{SYMBOL}:{TF}:origin:{T0}', symbol=SYMBOL, timeframe=TF,
+                  type='origin', direction=0, time=T0, process_time=T0,
+                  block_zero=120.0, block_one=100.0, ss_level=111.0)
+    assert not any(i.endswith(':ss_level') for i in origin.get_lvl_ids())
+
+
+def test_tests_only_count_after_the_move_away_ends():
+    """Its own bars sit against the level, so `test_time` is the move end.
+
+    Without this every SS level reads tested on the bar after it was created.
+    """
+    zone = an_mth()
+    _td, test_time, created_by = _get_level_test_params('ss_level', zone)
+    assert test_time == zone.move_end_time
+    assert created_by == 'body', 'must not be "close", which would add a confirmation move'
