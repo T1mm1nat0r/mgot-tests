@@ -830,8 +830,16 @@ def main():
     from mgot_utils.processing.lvl_preprocessor import create_lvls
     from mgot_utils.processing.post_process import post_process_zone, update_mth, update_origin, update_squeeze
 
-    # 3a. create_lvls — new MTH zone, delta_t = 0 (no bar retrieval)
-    fresh_zone_data = {**MTH_ZONE_DATA, 'time': str(T), 'id': f'{SYMBOL}:{TF}:mth:{T}'}
+    # 3a. create_lvls — new MTH zone on the bar it is processed, delta_t = 1.
+    #
+    # This measured an early return until 2026-09-07. It set only `time` and left
+    # MTH_ZONE_DATA's `move_end_time` at '0', so under the old anchor (`zone.time`
+    # for an mth) delta_t was 0 and `create_lvls` returned an EMPTY list — the
+    # benchmark timed the guard clause, not the two levels in its own label.
+    # `move_end_time` is now set to one bar before the benchmark bar, which is
+    # what production produces: process_time == move_end + 1.
+    fresh_zone_data = {**MTH_ZONE_DATA, 'time': str(T), 'id': f'{SYMBOL}:{TF}:mth:{T}',
+                       'move_end_time': str(T - TF_DELTA), 'process_time': str(T)}
     fresh_zone = Zone.initiate_zone(fresh_zone_data)
 
     def setup_3a():

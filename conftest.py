@@ -167,6 +167,13 @@ def sample_mth_zone() -> dict:
     Basic MTH zone fixture.
 
     Returns an incomplete bullish MTH zone.
+
+    `process_time` is `move_end_time + 1 bar`, which is what `create_mth_zone`
+    produces: it is called on the direction-change bar. The fixture carried
+    `time + 2 bars` with `move_end_time` unset until 2026-09-07 — the shape of
+    the peak-era formula, impossible under either the old rule (move_end + 3) or
+    the current one. Nothing called `create_lvls` with it, so nothing failed; it
+    was simply the wrong thing to copy from.
     """
     return {
         'id': 'BTCUSDT:1h:mth:1700000000000',
@@ -176,8 +183,8 @@ def sample_mth_zone() -> dict:
         'direction': 1,
         'completion': 'incomplete',
         'time': 1700000000000,
-        'process_time': 1700007200000,
-        'move_end_time': 0,
+        'process_time': 1700010800000,
+        'move_end_time': 1700007200000,
         'block_zero': 49500.0,  # Move open (support)
         'block_zero_id': 'BTCUSDT:1h:mth:1700000000000:block_zero',
         'block_one': 50500.0,  # Peak close (resistance)
