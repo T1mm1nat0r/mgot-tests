@@ -73,10 +73,10 @@ HSET_HANDOFFS = [
         id='origin flag: Zone.mark_complete -> Bar -> console markers',
     ),
     pytest.param(
-        'utils/src/mgot_utils/processing/squeeze.py', 'zone.id', 'completion',
-        'Zone', 'utils/src/mgot_utils/processing/s2.py',
-        "('invalid', 'absorbed')",
-        id='completion=absorbed: expand_block -> Zone -> s2 SS candidate scan',
+        'utils/src/mgot_utils/processing/squeeze.py', 'zone.id', 'block_id',
+        'Zone', 'utils/src/mgot_utils/processing/htf_links.py',
+        'htf_zone.block_id',
+        id='block_id: _join_block -> Zone -> htf_links eligibility',
     ),
 ]
 
@@ -182,17 +182,46 @@ def test_og_mth_value_survives_every_hop_of_the_origin_chain():
         'hop 4: the next origin no longer reads the chained value back off the Move'
 
 
-def test_absorbed_is_a_real_completion_state():
-    """`hset(zone.id, 'completion', 'absorbed')` bypasses the model entirely.
+def test_absorption_records_membership_and_does_not_overwrite_completion():
+    """Absorption writes `block_id`; it must not touch `completion`.
 
-    Writing the literal skips pydantic's validation, so an invented state would
-    be stored happily and then fail — or worse, silently mismatch — on the next
-    `Zone.initiate_zone`. Absorption is how an MTH leaves `zones_index` while
-    staying in `mth_index`, which is exactly the case a reset once got wrong.
+    Until 2026-09-09 `_join_block` (then `_remove_mth_zone`) did
+    `hset(zone.id, 'completion', 'absorbed')`, which overwrote the state it was
+    describing: 319 of 319 absorbed MTHs on 15m had completed *and* been taken
+    out first, and five call sites then read the label as "never became
+    structure". Membership is a separate fact, so it gets a separate field.
+
+    `absorbed` stays in the enum — state written before that date still carries
+    it, and the containment and htf_links guards still accept it — but nothing
+    writes it any more. Both legs are asserted: a raw `hset` bypasses pydantic,
+    so the literal and the model field have to agree.
     """
     squeeze = _read('utils/src/mgot_utils/processing/squeeze.py')
-    assert "'completion', 'absorbed'" in squeeze
-    assert 'absorbed' in {c.value for c in Completion}
+    assert "'block_id', block.id" in squeeze, 'absorption no longer records membership'
+    assert "'completion', 'absorbed'" not in squeeze, \
+        'absorption is overwriting completion again — that erases taken_out/complete'
+    assert 'block_id' in Zone.model_fields
+    assert 'absorbed' in {c.value for c in Completion}, \
+        'the state must survive for hashes written before 2026-09-09'
+
+
+def test_a_block_member_keeps_its_levels():
+    """Every other zone state keeps its levels; absorbed was the only one that did not.
+
+    `_join_block` must not delete Level hashes or pull them from the
+    to_gain/to_lose queues. Deleting the `ss_level` was one of two accidents
+    that made block members ineligible as squeeze bases — see
+    business_rules_squeezes.md.
+    """
+    tree = _tree('utils/src/mgot_utils/processing/squeeze.py')
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == '_join_block')
+    # The docstring explains what the old version did, so read the code only —
+    # a substring search over the whole function matches its own history.
+    code = ast.dump(ast.Module(body=fn.body[1:], type_ignores=[]))
+    assert 'get_lvl_ids' not in code, '_join_block is touching the levels again'
+    assert 'to_lose' not in code and 'to_gain' not in code, \
+        '_join_block is pulling levels out of the grading queues again'
 
 
 # ── model-less hashes passed between modules ─────────────────
