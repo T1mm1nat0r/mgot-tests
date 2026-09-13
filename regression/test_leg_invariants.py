@@ -444,3 +444,149 @@ def test_until_time_hides_an_mth_not_yet_processed():
     early = legs._apply_mth_breaks(chain, 'BTCUSDT', '15m', r,
                                    until_time=1700010000000)
     assert int(early[1].start_time) != 1700011000000
+
+
+# ---------------------------------------------------------------------------
+# A leg must end at the furthest point it actually reached, not at the origin
+# that terminated it (TA, 2026-09-14). `Leg.extreme` is documented as "furthest
+# body value reached in the trend direction" and was not: the endpoint came from
+# the terminating origin's own mth_value, and an origin is anchored on *its*
+# move, which need not be the deepest in the leg.
+#
+# NQU6 2 July: the bearish leg recorded 29413.00 and ended 19:15, while an MTH
+# inside it closed at 29338.50 and was processed at 18:00. Price made a low,
+# bounced, made a higher low, and the origin formed off the second one.
+# ---------------------------------------------------------------------------
+
+
+def _deep(mths=()):
+    """Bearish leg 110 -> 90, then a bullish one. MTHs land inside the first."""
+    times = [1700002000000, 1700009000000, 1700016000000]
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0), _o(times[2], 1, 115.0)]
+    r = MthFake({f'BTCUSDT:15m:move:{t}': {'time': str(t), 'length_bar': '2'}
+                 for t in times}, mths)
+    chain = legs._chain(origins, legs.turning_points(origins, '15m', r), None)
+    return legs._extend_to_deepest_mth(chain, 'BTCUSDT', '15m', r), r
+
+
+def test_a_deeper_same_direction_mth_moves_the_leg_end():
+    inside = 1700005000000
+    chain, _ = _deep(mths=[(inside, 0, 85.0)])
+    assert int(chain[0].end_time) == inside
+    assert float(chain[0].extreme) == 85.0
+    assert int(chain[1].start_time) == inside
+    assert float(chain[1].origin_extreme) == 85.0
+    assert chain[1].id.endswith(f':leg:{inside}')
+
+
+def test_an_mth_short_of_the_extreme_changes_nothing():
+    base, _ = _deep()
+    shallow, _ = _deep(mths=[(1700005000000, 0, 95.0)])
+    assert int(shallow[0].end_time) == int(base[0].end_time)
+    assert float(shallow[0].extreme) == float(base[0].extreme)
+
+
+def test_a_counter_direction_mth_is_not_this_rule():
+    """That is `_apply_mth_breaks`, and it moves the *start*, not the end."""
+    base, _ = _deep()
+    counter, _ = _deep(mths=[(1700005000000, 1, 85.0)])
+    assert int(counter[0].end_time) == int(base[0].end_time)
+
+
+def test_the_deepest_wins_not_the_last():
+    chain, _ = _deep(mths=[(1700004000000, 0, 88.0), (1700005000000, 0, 80.0),
+                           (1700006000000, 0, 86.0)])
+    assert int(chain[0].end_time) == 1700005000000
+    assert float(chain[0].extreme) == 80.0
+
+
+def test_start_mth_time_comes_back_with_the_boundary():
+    """The boundary moves *backward*, so the gather bound has to be lowered or
+    it sits after the leg's own start — 9 of 12 real cases would have."""
+    inside = 1700005000000
+    chain, _ = _deep(mths=[(inside, 0, 85.0)])
+    assert int(chain[1].start_mth_time or 0) <= int(chain[1].start_time)
+
+
+def test_the_leg_never_ends_before_it_starts():
+    chain, _ = _deep(mths=[(1700005000000, 0, 85.0)])
+    for leg in chain:
+        if leg.end_time:
+            assert int(leg.end_time) >= int(leg.start_time)
+
+
+def test_an_mth_outside_the_leg_is_ignored():
+    base, _ = _deep()
+    outside, _ = _deep(mths=[(1700020000000, 0, 50.0)])
+    assert int(outside[0].end_time) == int(base[0].end_time)
+
+
+def test_until_time_hides_an_mth_not_yet_processed():
+    times = [1700002000000, 1700009000000, 1700016000000]
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0), _o(times[2], 1, 115.0)]
+    r = MthFake({f'BTCUSDT:15m:move:{t}': {'time': str(t), 'length_bar': '2'}
+                 for t in times}, [(1700005000000, 0, 85.0)])
+    chain = legs._chain(origins, legs.turning_points(origins, '15m', r), None)
+    early = legs._extend_to_deepest_mth(chain, 'BTCUSDT', '15m', r,
+                                        until_time=1700004000000)
+    assert int(early[0].end_time) != 1700005000000
+
+
+# ---------------------------------------------------------------------------
+# Wiring. The two MTH passes above are tested directly, which does not prove
+# `build_legs` calls them — removing either call left all of those green. These
+# go through the real entry point.
+# ---------------------------------------------------------------------------
+
+
+class ChainFake(MthFake):
+    """`MthFake` plus the completed-origin index `build_legs` reads."""
+
+    def __init__(self, moves, origins, mths=()):
+        super().__init__(moves, mths)
+        self.origins = {}
+        for o in origins:
+            self.h[o.id] = {
+                'id': o.id, 'symbol': o.symbol, 'timeframe': o.timeframe,
+                'type': 'origin', 'direction': str(o.direction),
+                'completion': 'complete', 'time': str(o.time),
+                'process_time': str(o.process_time),
+                'block_zero': str(o.block_zero), 'block_one': str(o.block_one),
+                'mth_value': str(o.mth_value), 'mth_move_id': o.mth_move_id,
+                'time_completed': str(o.time),
+            }
+            self.z.setdefault('BTCUSDT:15m:complete_origins_index', {})[o.id] = float(o.time)
+
+    def zrange(self, key, a, b, **kw):
+        return [m for _, m in sorted((s, m) for m, s in self.z.get(key, {}).items())]
+
+
+def _built(mths=()):
+    times = [1700002000000, 1700009000000, 1700016000000]
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0), _o(times[2], 1, 115.0)]
+    r = ChainFake({f'BTCUSDT:15m:move:{t}': {'time': str(t), 'length_bar': '2'}
+                   for t in times}, origins, mths)
+    return legs.build_legs('BTCUSDT', '15m', r)
+
+
+def test_build_legs_applies_the_deepest_mth_pass():
+    inside = 1700005000000
+    chain = _built(mths=[(inside, 0, 85.0)])
+    assert len(chain) >= 2
+    assert int(chain[0].end_time) == inside, (
+        'build_legs must run _extend_to_deepest_mth, not only expose it'
+    )
+    assert float(chain[0].extreme) == 85.0
+
+
+def test_build_legs_applies_the_mth_break_pass():
+    """The bullish leg departs 90.0; a bearish MTH inside it closing at 85.0
+    takes out the low it started from."""
+    turn = legs.turning_points(
+        [_o(1700009000000, 0, 90.0)], '15m',
+        MthFake({'BTCUSDT:15m:move:1700009000000':
+                 {'time': '1700009000000', 'length_bar': '2'}}))
+    after = int(list(turn.values())[0][0]) + 900_000
+    chain = _built(mths=[(after, 0, 85.0)])
+    moved = [l for l in chain if int(l.start_time) == after]
+    assert moved, 'build_legs must run _apply_mth_breaks, not only expose it'
