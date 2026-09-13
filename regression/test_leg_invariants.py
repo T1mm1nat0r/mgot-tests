@@ -328,3 +328,119 @@ def test_case_08_leg_ends_at_the_lower_low_turn():
     assert float(bearish.extreme) == 29249.75, (
         'the leg must reach the lower low, not stop at 29316.00'
     )
+
+
+# ---------------------------------------------------------------------------
+# An MTH that runs past the extreme its leg departed from moves the boundary
+# (TA, 2026-09-14). This is the half that arrives in time: an ending extension
+# needs a completed origin, and on NQU6 case 08 that origin completed 2h45m
+# after the MTH was processed.
+# ---------------------------------------------------------------------------
+
+
+class MthFake(FakeRedis):
+    """`FakeRedis` plus an mth_index and hash reads through a pipeline."""
+
+    def __init__(self, moves, mths=()):
+        super().__init__(moves)
+        self.h = {}
+        self.z = {}
+        for pt, direction, block_one in mths:
+            zid = f'BTCUSDT:15m:mth:{pt}'
+            self.h[zid] = {'id': zid, 'process_time': str(pt),
+                           'direction': str(direction), 'block_one': str(block_one)}
+            self.z.setdefault('BTCUSDT:15m:mth_index', {})[zid] = float(pt)
+        self._hq = []
+
+    def zrangebyscore(self, key, lo, hi, **kw):
+        def b(v, d):
+            if isinstance(v, (int, float)):
+                return float(v)
+            t = str(v).lstrip('(')
+            return d if t in ('+inf', '-inf') else float(t)
+        lo_v, hi_v = b(lo, float('-inf')), b(hi, float('inf'))
+        return [m for _, m in sorted((s, m) for m, s in self.z.get(key, {}).items()
+                                     if lo_v <= s <= hi_v)]
+
+    def hgetall(self, key):
+        self._hq.append(dict(self.h.get(key, {})))
+        return None
+
+    def pipeline(self, transaction=True):
+        return self
+
+    def execute(self):
+        if self._hq:
+            out, self._hq = self._hq, []
+            return out
+        return super().execute()
+
+
+def _two_legs(mths=()):
+    """A bearish leg then a bullish one, the bullish departing from 90.0."""
+    times = [1700002000000, 1700009000000, 1700016000000]
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0), _o(times[2], 1, 115.0)]
+    r = MthFake({f'BTCUSDT:15m:move:{t}': {'time': str(t), 'length_bar': '2'}
+                 for t in times}, mths)
+    chain = legs._chain(origins, legs.turning_points(origins, '15m', r), None)
+    return legs._apply_mth_breaks(chain, 'BTCUSDT', '15m', r), r
+
+
+def test_a_counter_trend_mth_past_the_leg_start_moves_the_boundary():
+    """The bullish leg departs from 90.0; a bearish MTH closing at 85.0 has
+    taken out the low the uptrend started from, so the uptrend ended there."""
+    inside = 1700011000000
+    chain, _ = _two_legs(mths=[(inside, 0, 85.0)])
+    assert int(chain[0].end_time) == inside
+    assert float(chain[0].extreme) == 85.0
+    assert int(chain[1].start_time) == inside
+    assert float(chain[1].origin_extreme) == 85.0
+    assert chain[1].id.endswith(f':leg:{inside}')
+
+
+def test_an_mth_that_holds_the_leg_start_changes_nothing():
+    """A pullback that does not reach the departure low is just a pullback."""
+    base, _ = _two_legs()
+    held, _ = _two_legs(mths=[(1700011000000, 0, 95.0)])
+    assert int(held[1].start_time) == int(base[1].start_time)
+
+
+def test_a_same_direction_mth_never_moves_the_boundary():
+    """Only a counter-trend MTH can take out the leg's own premise."""
+    base, _ = _two_legs()
+    same, _ = _two_legs(mths=[(1700011000000, 1, 85.0)])
+    assert int(same[1].start_time) == int(base[1].start_time)
+
+
+def test_the_furthest_qualifying_mth_wins():
+    """One pass is only sufficient because the furthest is taken."""
+    chain, _ = _two_legs(mths=[(1700010000000, 0, 88.0), (1700012000000, 0, 80.0)])
+    assert int(chain[1].start_time) == 1700012000000
+    assert float(chain[1].origin_extreme) == 80.0
+
+
+def test_start_mth_time_does_not_move_with_the_start():
+    """`refresh_legs` bounds its delete by start_time and its gather by
+    start_mth_time. Moving both pulls them apart — the 3m defect above."""
+    chain, _ = _two_legs(mths=[(1700011000000, 0, 85.0)])
+    assert chain[1].start_mth_time <= chain[1].start_time
+
+
+def test_an_mth_after_the_leg_ends_is_not_considered():
+    """The boundary may only move inside the leg it belongs to."""
+    base, _ = _two_legs()
+    after, _ = _two_legs(mths=[(1700020000000, 0, 50.0)])
+    assert int(after[1].start_time) == int(base[1].start_time)
+
+
+def test_until_time_hides_an_mth_not_yet_processed():
+    """Causality: process_time is when the MTH is knowable, and a historical
+    query must not use one from after the moment being asked about."""
+    times = [1700002000000, 1700009000000, 1700016000000]
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0), _o(times[2], 1, 115.0)]
+    r = MthFake({f'BTCUSDT:15m:move:{t}': {'time': str(t), 'length_bar': '2'}
+                 for t in times}, [(1700011000000, 0, 85.0)])
+    chain = legs._chain(origins, legs.turning_points(origins, '15m', r), None)
+    early = legs._apply_mth_breaks(chain, 'BTCUSDT', '15m', r,
+                                   until_time=1700010000000)
+    assert int(early[1].start_time) != 1700011000000
