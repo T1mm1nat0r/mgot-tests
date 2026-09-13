@@ -257,3 +257,74 @@ def test_extend_can_be_switched_off():
     off = legs._chain(origins, turns, extend=False)[0]
     on = legs._chain(origins, turns, extend=True)[0]
     assert on.extreme != off.extreme
+
+
+# ---------------------------------------------------------------------------
+# The extension scans the run; a pullback inside it does not stop the walk
+# (TA, 2026-09-13). Everything above stayed green through this change because
+# none of it covered a non-continuing origin followed by a continuing one.
+# ---------------------------------------------------------------------------
+
+# NQU6 case 08, real mth_values from `complete_origins_index`, MTH-ordered.
+CASE_08 = [
+    (1782384300000, 1, 30164.25),   # SELL — the bearish leg's start
+    (1782399600000, 0, 29316.00),   # BUY  — turn 25 Jun 14:00, ended the leg
+    (1782408600000, 0, 29651.00),   # BUY  — HIGHER: stopped the old walk here
+    (1782415800000, 0, 29672.25),   # BUY  — higher still
+    (1782424800000, 0, 29818.50),   # BUY  — higher still
+    (1782446400000, 0, 29249.75),   # BUY  — turn 26 Jun 03:30, a real lower low
+    (1782760500000, 1, 30053.50),   # SELL — closes the next leg
+]
+
+
+def _case_08_origins():
+    return [_o(t, d, v) for t, d, v in CASE_08]
+
+
+def test_a_pullback_inside_the_run_does_not_stop_the_walk():
+    """The old consecutive walk stopped at the first higher low and missed the
+    extreme the leg actually reached, three origins further on, with no
+    opposite-direction origin anywhere between them.
+
+        > "if a lower bullish origin was printed below. I would have prefered the
+        >  leg to have continoud until 3.30. There was a second mth, with no
+        >  bearish origin in between. so the leg actually just continous"
+        >  — TA, 2026-09-13
+    """
+    origins = _case_08_origins()
+    assert legs._extend_ending(origins, 1) == 5, (
+        'the ending must reach 29249.75 (turn 26 Jun 03:30), not stop at the '
+        'first higher low'
+    )
+
+
+def test_the_opposite_direction_origin_still_bounds_the_scan():
+    """What keeps the scan from running away: it is the same terminus `_chain`
+    uses. The trailing SELL at 30053.50 is never a candidate."""
+    origins = _case_08_origins()
+    assert legs._extend_ending(origins, 1) != 6
+
+
+def test_the_scan_takes_the_furthest_not_the_last():
+    """A lower low followed by a higher one keeps the lower."""
+    times = [1700002000000, 1700009000000, 1700016000000, 1700023000000]
+    origins = [_o(times[0], 1, 110.0), _o(times[1], 0, 90.0),
+               _o(times[2], 0, 80.0), _o(times[3], 0, 95.0)]
+    assert legs._extend_ending(origins, 1) == 2
+    # mirrored for a sell-zone ending
+    origins = [_o(times[0], 0, 90.0), _o(times[1], 1, 110.0),
+               _o(times[2], 1, 120.0), _o(times[3], 1, 105.0)]
+    assert legs._extend_ending(origins, 1) == 2
+
+
+def test_case_08_leg_ends_at_the_lower_low_turn():
+    """End to end through `_chain`: the bearish leg must span the whole move."""
+    origins = _case_08_origins()
+    r = _turns_for([t for t, _, _ in CASE_08])
+    turns = legs.turning_points(origins, '15m', r)
+    chain = legs._chain(origins, turns, extend=True)
+    bearish = chain[0]
+    assert int(bearish.direction) == 0
+    assert float(bearish.extreme) == 29249.75, (
+        'the leg must reach the lower low, not stop at 29316.00'
+    )
