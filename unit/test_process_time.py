@@ -95,6 +95,12 @@ def fake_redis(monkeypatch):
     monkeypatch.setattr(zone_preprocessor, 'apply_htf_links', lambda zone, conn: zone)
     monkeypatch.setattr(zone_preprocessor, 'initiate_base', lambda zone, conn: zone)
     monkeypatch.setattr(zone_preprocessor, 'expand_block', lambda zone, conn: zone)
+    # Since 2026-09-11 `create_mth_zone` also looks for the secondary swing — the
+    # SS is drawn at the MTH's creation rather than at its completion. These
+    # tests are about `process_time` arithmetic, so the search is stubbed out
+    # rather than given a Redis complete enough to satisfy it.
+    monkeypatch.setattr(zone_preprocessor, 'find_secondary_swing',
+                        lambda zone, bar, conn: None)
     return fake
 
 
