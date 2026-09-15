@@ -1,8 +1,7 @@
 """How a Leg is built, and the invariants it must not break.
 
 Replaces the origin-pair chain (`_chain` + `_extend_ending` +
-`_extend_to_deepest_mth` + `_apply_mth_breaks` + the unwired `_ending_held`),
-all removed on 2026-09-15. TA's construction, in his words:
+`_extend_to_deepest_mth` + `_apply_mth_breaks`), all removed on 2026-09-15. TA's construction, in his words:
 
   1. a completed origin sets the leg's direction; the leg starts at its original MTH
   2. until an opposite origin completes, each same-direction MTH beyond the

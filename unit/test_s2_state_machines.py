@@ -779,3 +779,112 @@ class TestTrendConfirmationRetiresSS:
         r = FakeRedis()
         self._world(r, tested_wick=1)
         assert ss_invalidation.trend_confirmed_against(make_zone(zone_type='mth'), r) is None
+
+
+class TestInternalSSInvalidationIsIncremental:
+    """The verdict must not re-walk the span every bar.
+
+    A squeeze's span runs from its base to its source MTH, and a base days old
+    covers most of a symbol's history. Walking it per squeeze per bar measured as
+    runs of ~4,150 consecutive hmgets on BTCUSDT 3m — 4,488 per bar across all
+    squeezes, the dominant cost once `_tracked_mth` was made incremental.
+
+    Two properties make it incremental, and both are asserted here because the
+    optimisation is wrong without them: the denominator is fixed at creation, and
+    testing is monotonic (`complete_zone_tests` preserves the figure across a
+    takeout, so a tested MTH never becomes untested).
+    """
+
+    FIELDS = ('direction', 'zone_tests', 'complete_zone_tests')
+
+    class _Pipe:
+        """Queues and replays, as redis-py does. A fake whose pipeline is the
+        connection itself cannot tell a queued call from a direct one, and then
+        `execute` returns nothing while the direct call looks fine."""
+
+        def __init__(self, conn):
+            self.conn, self.queued = conn, []
+
+        def __getattr__(self, name):
+            def queue(*a, **kw):
+                self.queued.append((name, a, kw))
+                return self
+            return queue
+
+        def execute(self):
+            out = [getattr(self.conn, n)(*a, **kw) for n, a, kw in self.queued]
+            self.queued.clear()
+            return out
+
+    class _Redis:
+        def __init__(self, mths):
+            self.mths = {m.id: m for m in mths}
+            self.sets = {}
+            self.span_scans = 0
+
+        def zrangebyscore(self, key, lo, hi, **kw):
+            self.span_scans += 1
+            return list(self.mths)
+
+        def hmget(self, key, *fields):
+            m = self.mths.get(key)
+            if m is None:
+                return [None] * len(fields)
+            return [str(getattr(m, f, '') or 0) for f in fields]
+
+        def pipeline(self, transaction=True):
+            return TestInternalSSInvalidationIsIncremental._Pipe(self)
+
+        def sadd(self, key, *members):
+            self.sets.setdefault(key, set()).update(members)
+
+        def smembers(self, key):
+            return set(self.sets.get(key, set()))
+
+        def srem(self, key, *members):
+            self.sets.get(key, set()).difference_update(members)
+
+    def _redis(self, mths):
+        return self._Redis(mths)
+
+    def _squeeze(self, **kw):
+        from mgot_utils.models.zone import SqueezeZone
+        return SqueezeZone(id=f'{SYM}:{TF}:squeeze:1000', symbol=SYM, timeframe=TF,
+                           type='squeeze', swing='ss', direction=1, time=1000,
+                           process_time=1000, move_end_time=5000, **kw)
+
+    def test_the_span_is_walked_once_not_every_bar(self):
+        mths = [make_zone('mth', 1, 2000, zone_tests=0),
+                make_zone('mth', 1, 3000, zone_tests=0)]
+        r = self._redis(mths)
+        sq = self._squeeze()
+        first = ss_invalidation.evaluate(sq, r)
+        assert first['ss_internal_total'] == 2 and first['ss_scanned'] == 1
+        assert r.span_scans == 1
+
+        # carry the verdict back onto the zone, as `apply` does
+        for k, v in first.items():
+            setattr(sq, k, v)
+        again = ss_invalidation.evaluate(sq, r)
+        assert again['ss_internal_total'] == 2
+        assert r.span_scans == 1, 'the span was walked a second time'
+
+    def test_a_member_becoming_tested_is_picked_up_without_rescanning(self):
+        mths = [make_zone('mth', 1, 2000, zone_tests=0),
+                make_zone('mth', 1, 3000, zone_tests=0)]
+        r = self._redis(mths)
+        sq = self._squeeze()
+        for k, v in ss_invalidation.evaluate(sq, r).items():
+            setattr(sq, k, v)
+        assert sq.ss_internal_tested == 0 and sq.ss_expect_sweep == 0
+
+        mths[0].zone_tests = 1                     # one gets tested
+        out = ss_invalidation.evaluate(sq, r)
+        assert out['ss_internal_tested'] == 1 and out['ss_expect_sweep'] == 0
+        for k, v in out.items():
+            setattr(sq, k, v)
+
+        mths[1].complete_zone_tests = 2            # and the other, pre-takeout
+        final = ss_invalidation.evaluate(sq, r)
+        assert final['ss_internal_tested'] == 2 and final['ss_expect_sweep'] == 1
+        assert r.span_scans == 1
