@@ -77,6 +77,10 @@ CLEANED_VIA_INDEX = {
     'squeeze': 'zones_index',
     'move': 'sorted:moves',
     'leg': 'legs_index',
+    # The origin-derived chain is a second, independent set of legs with its
+    # own index and id namespace (2026-09-15). Cleared the same way `leg` is:
+    # the hashes are deleted through the index members, not by pattern.
+    'originleg': 'origin_legs_index',
     'dance': 'dance_index',
 }
 

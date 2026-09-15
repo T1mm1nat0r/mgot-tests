@@ -226,3 +226,99 @@ def test_a_chained_origins_extremes_are_candidates_not_the_endpoint():
     o3 = _origin(T0, 0, 90.0, og=105.0)
     out3 = build([o3], [_mth(T0 + 5 * D, 1, 140.0)])
     assert float(out3[0].origin_extreme) == 105.0
+
+
+# ---------------------------------------------------------------------------
+# Two chains, side by side (TA, 2026-09-15)
+#
+#   "Now that I look at the new legs I think this is perfect for squeeze
+#    directions. However I do think I would like to have the old leg derived from
+#    origin setup back too. Preferably there are 2 types of legs identified, the
+#    current new one, and the previous one based on the origins."
+#
+# They answer different questions and disagree often — 123 against 168 on NQU6
+# 15m — so the risk is not that one is wrong but that they contaminate each
+# other. These pin the separation.
+# ---------------------------------------------------------------------------
+
+
+class _ChainRedis:
+    """Serves `complete_origins_index`, origin hashes and move hashes."""
+
+    def __init__(self, origins, moves):
+        self.h, self.z, self._q = {}, {}, []
+        for o in origins:
+            self.h[o.id] = {k: str(v) for k, v in
+                            o.model_dump(exclude_none=True, mode='json').items()}
+            self.z.setdefault(f'{SYM}:{TF}:complete_origins_index', {})[o.id] = float(o.time)
+        self.h.update(moves)
+
+    def zrange(self, key, a, b, **kw):
+        return [m for _, m in sorted((s, m) for m, s in self.z.get(key, {}).items())]
+
+    def hgetall(self, key):
+        self._q.append(dict(self.h.get(key, {})))
+        return None
+
+    def hmget(self, key, *fields):
+        row = self.h.get(key, {})
+        self._q.append([row.get(f) for f in fields])
+        return None
+
+    def pipeline(self, transaction=True):
+        return self
+
+    def execute(self):
+        out, self._q = self._q, []
+        return out
+
+
+def _both(origins, mths):
+    moves = {f'{SYM}:{TF}:move:{o.time}': {'time': str(o.time), 'length_bar': '2'}
+             for o in origins}
+    r = _ChainRedis(origins, moves)
+    mth_legs = build(origins, mths)                       # the event-driven chain
+    origin_legs = legs.build_origin_legs(SYM, TF, r)      # the origin-pair chain
+    return mth_legs, origin_legs
+
+
+def _scenario():
+    origins = [_origin(T0, 1, 110.0), _origin(T0 + 10 * D, 0, 90.0),
+               _origin(T0 + 30 * D, 1, 118.0)]
+    mths = [_mth(T0 + 5 * D, 0, 85.0), _mth(T0 + 20 * D, 1, 115.0)]
+    return _both(origins, mths)
+
+
+def test_the_two_chains_carry_their_own_kind():
+    mth_legs, origin_legs = _scenario()
+    assert mth_legs and origin_legs
+    assert {l.kind for l in mth_legs} == {'mth'}
+    assert {l.kind for l in origin_legs} == {'origin'}
+
+
+def test_the_two_chains_never_share_an_id():
+    """Separate namespaces, or one chain's `hset` silently overwrites the other's
+    leg — the hashes live in the same keyspace."""
+    mth_legs, origin_legs = _scenario()
+    assert all(':leg:' in l.id for l in mth_legs)
+    assert all(':originleg:' in l.id for l in origin_legs)
+    assert not ({l.id for l in mth_legs} & {l.id for l in origin_legs})
+
+
+def test_kind_defaults_to_mth_for_legs_written_before_the_field():
+    """Stored legs predate `kind`, and must not read as the origin chain."""
+    from mgot_utils.models.leg import Leg
+    old = Leg(id=f'{SYM}:{TF}:leg:{T0}', symbol=SYM, timeframe=TF, direction=1,
+              start_time=T0, end_time=T0 + D, extreme=100.0, origin_extreme=90.0)
+    assert old.kind == 'mth'
+
+
+def test_the_origin_chain_reads_only_completed_origins():
+    """That is the property worth keeping it for: it cannot disagree with the
+    origins it derives from, whatever the MTH stream does."""
+    origins = [_origin(T0, 1, 110.0), _origin(T0 + 10 * D, 0, 90.0)]
+    moves = {f'{SYM}:{TF}:move:{o.time}': {'time': str(o.time), 'length_bar': '2'}
+             for o in origins}
+    bare = legs.build_origin_legs(SYM, TF, _ChainRedis(origins, moves))
+    # no MTHs supplied at all, and it still produces the chain
+    assert bare and bare[0].kind == 'origin'
