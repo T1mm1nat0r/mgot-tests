@@ -470,36 +470,56 @@ class TestOpenLegDirection:
     open leg that always read as direction 0 made the trend look permanently
     down — the dance spent 2019 bars in a down state against 16 up on 15m while
     the legs themselves were 30 up to 32 down.
+
+    Since 2026-09-15 this is structural rather than a special case: direction
+    comes from the **origin** for every leg, open or closed, so there is no
+    travel-based fallback left to get wrong. The old closed-leg rule — direction
+    from the price travel between endpoints — was itself the defect that let an
+    origin-to-origin span which happened to fall be a bearish leg even when it
+    departed a buy zone, producing runs of three same-direction legs.
     """
 
-    def _origin(self, direction, mth_value, time=1000):
-        return Zone(id=f'{SYM}:{TF}:origin:{time}', symbol=SYM, timeframe=TF,
-                    type='origin', direction=direction, time=time,
-                    process_time=time + 900000, mth_value=mth_value,
-                    mth_move_id=f'{SYM}:{TF}:move:{time}',
-                    block_zero=mth_value, block_one=mth_value + 10)
+    D = 900_000
+    T = 1700000000000
+
+    def _origin(self, direction, mth_value, time=None):
+        t = self.T if time is None else time
+        return Zone(id=f'{SYM}:{TF}:origin:{t}', symbol=SYM, timeframe=TF,
+                    type='origin', direction=direction, completion='complete',
+                    time=t, process_time=t + self.D, mth_value=mth_value,
+                    mth_move_id=f'{SYM}:{TF}:move:{t}',
+                    block_zero=mth_value, block_one=mth_value + 10,
+                    time_completed=t + self.D)
+
+    def _build(self, origins, mths):
+        from mgot_utils.processing import legs
+        turns = {o.id: (int(o.time), o.mth_move_id) for o in origins}
+        recs = legs._build_records(origins, turns, sorted(mths))
+        return legs._records_to_legs(recs, SYM, TF)
 
     def test_open_leg_from_a_bullish_origin_travels_down(self):
-        from mgot_utils.processing.legs import _leg_from_pair
+        """Stored direction 1 is a sell zone; the leg departs it travelling down."""
         start = self._origin(1, 100.0)
-        leg = _leg_from_pair(start, None, {start.id: 1000})
-        assert leg.complete == 0
-        assert leg.direction == 0
+        legs_out = self._build([start], [(self.T + 5 * self.D, 0, 80.0)])
+        assert legs_out[-1].complete == 0
+        assert legs_out[-1].direction == 0
 
     def test_open_leg_from_a_bearish_origin_travels_up(self):
-        from mgot_utils.processing.legs import _leg_from_pair
         start = self._origin(0, 100.0)
-        leg = _leg_from_pair(start, None, {start.id: 1000})
-        assert leg.complete == 0
-        assert leg.direction == 1, 'an open leg must not default to bearish'
+        legs_out = self._build([start], [(self.T + 5 * self.D, 1, 120.0)])
+        assert legs_out[-1].complete == 0
+        assert legs_out[-1].direction == 1, 'an open leg must not default to bearish'
 
-    def test_closed_leg_direction_still_comes_from_price(self):
-        from mgot_utils.processing.legs import _leg_from_pair
-        start = self._origin(1, 100.0, 1000)
-        end = self._origin(0, 120.0, 2000)
-        leg = _leg_from_pair(start, end, {start.id: 1000, end.id: 2000})
-        assert leg.complete == 1
-        assert leg.direction == 1
+    def test_a_closed_leg_that_fell_still_takes_its_direction_from_the_origin(self):
+        """The case the old price-travel rule got wrong: a leg departing a buy
+        zone whose endpoints happen to fall is still a bullish leg, not a third
+        bearish one in a row."""
+        a = self._origin(0, 100.0, self.T)                 # buy zone -> bullish
+        b = self._origin(1, 90.0, self.T + 20 * self.D)    # sell zone closes it
+        out = self._build([a, b], [(self.T + 5 * self.D, 1, 104.0),
+                                   (self.T + 25 * self.D, 0, 70.0)])
+        assert out[0].complete == 1
+        assert out[0].direction == 1
 
 
 # ── State 1: the with-trend SS ───────────────────────────────
