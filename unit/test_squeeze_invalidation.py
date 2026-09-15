@@ -68,6 +68,14 @@ class FakeRedis:
     def hget(self, key, field):
         return self.h.get(key, {}).get(field)
 
+    def hmget(self, key, *fields):
+        """`_tracked_mth` reads six fields rather than the whole hash — the
+        2026-09-15 performance fix. Missing keys yield all-None, which is how the
+        real client behaves and how the caller detects absence."""
+        row = self.h.get(key, {})
+        names = fields[0] if len(fields) == 1 and isinstance(fields[0], (list, tuple)) else fields
+        return [row.get(f) for f in names]
+
     def zadd(self, key, mapping):
         self.z.setdefault(key, {}).update(mapping)
 

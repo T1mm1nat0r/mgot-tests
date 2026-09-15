@@ -350,11 +350,18 @@ class TestTenSK:
 # ── Internal SS invalidation ─────────────────────────────────
 
 class TestInternalSSInvalidation:
+    # `inner_mths` reads three fields with hmget rather than pulling whole zone
+    # hashes and building a pydantic Zone from each (2026-09-15 performance fix),
+    # so the fake returns hmget rows in that field order.
+    FIELDS = ('direction', 'zone_tests', 'complete_zone_tests')
+
     def _redis_with(self, mths):
         r = MagicMock()
         r.zrangebyscore.return_value = [m.id for m in mths]
         pipe = MagicMock()
-        pipe.execute.return_value = [m.model_dump(mode='json') for m in mths]
+        pipe.execute.return_value = [
+            [str(getattr(m, f, '') or 0) for f in self.FIELDS] for m in mths
+        ]
         r.pipeline.return_value = pipe
         return r
 

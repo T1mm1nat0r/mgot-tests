@@ -366,6 +366,19 @@ class MthFake(FakeRedis):
         self._hq.append(dict(self.h.get(key, {})))
         return None
 
+    def hmget(self, key, *fields):
+        """Zone hashes live in `self.h`; move hashes in `self.moves`.
+
+        `_mth_points` reads three fields with `hmget` rather than pulling all 56
+        with `hgetall` — that was the 2026-09-15 performance fix — so the fake has
+        to serve both shapes through the same pipeline.
+        """
+        if key in self.h:
+            row = self.h[key]
+            self._hq.append([row.get(f) for f in fields])
+            return None
+        return super().hmget(key, *fields)
+
     def pipeline(self, transaction=True):
         return self
 
