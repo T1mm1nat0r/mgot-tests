@@ -242,6 +242,24 @@ def test_a_chained_origins_extremes_are_candidates_not_the_endpoint():
 # ---------------------------------------------------------------------------
 
 
+class _Pipe:
+    """Queues calls and replays them on execute, as redis-py does."""
+
+    def __init__(self, conn):
+        self.conn, self.queued = conn, []
+
+    def __getattr__(self, name):
+        def queue(*a, **kw):
+            self.queued.append((name, a, kw))
+            return self
+        return queue
+
+    def execute(self):
+        out = [getattr(self.conn, n)(*a, **kw) for n, a, kw in self.queued]
+        self.queued.clear()
+        return out
+
+
 class _ChainRedis:
     """Serves `complete_origins_index`, origin hashes and move hashes."""
 
@@ -256,21 +274,20 @@ class _ChainRedis:
     def zrange(self, key, a, b, **kw):
         return [m for _, m in sorted((s, m) for m, s in self.z.get(key, {}).items())]
 
+    # A direct read returns its value; a pipelined one queues. The first version
+    # of this fake queued on every call and returned None, so `Leg.fetch_by_id`
+    # — which reads directly — silently got nothing and the bootstrap looked
+    # broken when it was working. A fake that cannot tell the two apart will
+    # always mislead here.
     def hgetall(self, key):
-        self._q.append(dict(self.h.get(key, {})))
-        return None
+        return dict(self.h.get(key, {}))
 
     def hmget(self, key, *fields):
         row = self.h.get(key, {})
-        self._q.append([row.get(f) for f in fields])
-        return None
+        return [row.get(f) for f in fields]
 
     def pipeline(self, transaction=True):
-        return self
-
-    def execute(self):
-        out, self._q = self._q, []
-        return out
+        return _Pipe(self)
 
 
 def _both(origins, mths):
@@ -322,3 +339,84 @@ def test_the_origin_chain_reads_only_completed_origins():
     bare = legs.build_origin_legs(SYM, TF, _ChainRedis(origins, moves))
     # no MTHs supplied at all, and it still produces the chain
     assert bare and bare[0].kind == 'origin'
+
+
+class _BootstrapRedis(_ChainRedis):
+    """Adds the marker/zcard surface the bootstrap needs, and records writes."""
+
+    def __init__(self, origins, moves):
+        super().__init__(origins, moves)
+        self.kv, self.written = {}, []
+
+    def exists(self, key):
+        return 1 if key in self.kv else 0
+
+    def set(self, key, value):
+        self.kv[key] = str(value)
+
+    def zcard(self, key):
+        return len(self.z.get(key, {}))
+
+    def zrevrangebyscore(self, key, hi, lo, start=0, num=None, **kw):
+        def b(v, d):
+            if isinstance(v, (int, float)):
+                return float(v)
+            t = str(v).lstrip('(')
+            return d if t in ('+inf', '-inf') else float(t)
+        lo_v, hi_v = b(lo, float('-inf')), b(hi, float('inf'))
+        out = [m for _, m in sorted(((s, m) for m, s in self.z.get(key, {}).items()),
+                                    reverse=True) if lo_v <= self.z[key][m] <= hi_v]
+        return out[start:start + num] if num else out[start:]
+
+    def hset(self, key, mapping=None, **kw):
+        self.h[key] = {k: str(v) for k, v in (mapping or {}).items()}
+        self.written.append(key)
+
+    def zadd(self, key, mapping):
+        self.z.setdefault(key, {}).update(mapping)
+
+    def zrem(self, key, *members):
+        for m in members:
+            self.z.get(key, {}).pop(m, None)
+
+    def delete(self, *keys):
+        for k in keys:
+            self.h.pop(k, None); self.z.pop(k, None); self.kv.pop(k, None)
+
+
+def _bootstrap_fixture():
+    origins = [_origin(T0, 1, 110.0), _origin(T0 + 10 * D, 0, 90.0),
+               _origin(T0 + 30 * D, 1, 118.0)]
+    moves = {f'{SYM}:{TF}:move:{o.time}': {'time': str(o.time), 'length_bar': '2'}
+             for o in origins}
+    return _BootstrapRedis(origins, moves)
+
+
+def test_the_origin_chain_bootstraps_on_first_query():
+    """`refresh_origin_legs` only runs when an origin completes. A symbol that has
+    finished replaying and parked never fires one again, so without this its chain
+    stays empty forever — NQU6 came out of the 2026-09-15 deploy with 126 MTH legs
+    and zero origin legs."""
+    r = _bootstrap_fixture()
+    assert r.zcard(f'{SYM}:{TF}:origin_legs_index') == 0
+    leg = legs.origin_leg_at_time(SYM, TF, T0 + 40 * D, r)
+    assert leg is not None and leg.kind == 'origin'
+    assert r.zcard(f'{SYM}:{TF}:origin_legs_index') > 0
+
+
+def test_the_bootstrap_runs_once():
+    """An early-history query that legitimately finds no leg must not rebuild the
+    chain on every call."""
+    r = _bootstrap_fixture()
+    legs.origin_leg_at_time(SYM, TF, T0 + 40 * D, r)
+    n = len(r.written)
+    legs.origin_leg_at_time(SYM, TF, T0 - D, r)      # before any leg starts
+    assert len(r.written) == n
+
+
+def test_the_two_chains_bootstrap_independently():
+    """Sharing a marker would let whichever ran first suppress the other."""
+    r = _bootstrap_fixture()
+    legs.origin_leg_at_time(SYM, TF, T0 + 40 * D, r)
+    assert f'{SYM}:{TF}:origin_legs_built' in r.kv
+    assert f'{SYM}:{TF}:legs_built' not in r.kv
