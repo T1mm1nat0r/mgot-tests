@@ -2,7 +2,7 @@
 The materialised leg chain must equal the reference chain — at every point.
 
 `build_legs` is the definition of a Leg: chain every completed origin, oldest
-MTH first. `refresh_legs` maintains the same chain incrementally in
+MTH first. `refresh_legs` re-materialises that same chain in
 `legs_index`, rebuilding only a bounded tail, because the definition is O(n) and
 `apply_htf_links` asks for the running leg on up to three higher timeframes at
 every zone creation.
@@ -28,7 +28,7 @@ import pytest
 
 from mgot_utils.models import Zone
 from mgot_utils.models.leg import Leg
-from mgot_utils.processing.legs import build_legs, maintain_legs
+from mgot_utils.processing.legs import build_legs, maintain_legs, refresh_legs
 
 FIXTURE = Path(__file__).parent.parent / 'fixtures' / 'legs_origin_stream.json'
 
@@ -89,6 +89,29 @@ def _materialised(symbol, timeframe, r):
     return [Leg.initiate_leg(d) for d in pipe.execute() if d]
 
 
+def _seed_mths(mths, r):
+    """Seed the MTH stream and its index.
+
+    The fixture carried only origins and moves until 2026-09-15, because the
+    origin-pair chain read nothing else. The construction that replaced it is
+    MTH-driven, so without these `build_legs` returns an empty chain and
+    `test_materialised_matches_reference_throughout_replay` compares [] to [] —
+    which is exactly how it stayed green through a real index-vs-definition
+    drift in production.
+    """
+    if not mths:
+        return
+    pipe = r.pipeline()
+    by_tf = {}
+    for zid, fields in mths.items():
+        pipe.hset(zid, mapping=fields)
+        parts = zid.split(':')
+        by_tf.setdefault((parts[0], parts[1]), {})[zid] = float(fields['time'])
+    for (sym, tf), members in by_tf.items():
+        pipe.zadd(f'{sym}:{tf}:mth_index', members)
+    pipe.execute()
+
+
 def _seed_moves(moves, r):
     pipe = r.pipeline()
     for move_id, fields in moves.items():
@@ -104,6 +127,7 @@ def test_materialised_matches_reference_throughout_replay(stream, redis_client, 
     data = stream['timeframes'][timeframe]
     origins, stride = data['origins'], STRIDE[timeframe]
     _seed_moves(data['moves'], redis_client)
+    _seed_mths(data.get('mths', {}), redis_client)
 
     events = _events(origins)
     assert events, f'fixture has no events for {timeframe}'
@@ -128,37 +152,65 @@ def test_materialised_matches_reference_throughout_replay(stream, redis_client, 
         )
 
     assert checked > 0
+    # A fixture that yields no legs makes every comparison above [] == [], which
+    # is how this test stayed green through a real drift. Fail on the fixture
+    # rather than pass on nothing.
+    assert build_legs(symbol, timeframe, redis_client), (
+        f'{timeframe}: the fixture produced no legs, so nothing was compared'
+    )
 
 
 @pytest.mark.integration
-def test_takeout_invalidation_merges_legs(stream, redis_client):
-    """A takeout that unseats an ending must shrink the chain, not orphan a leg.
+def test_the_index_never_keeps_a_leg_the_definition_dropped(stream, redis_client):
+    """A rebuild must delete what it no longer produces, not lay new legs beside old.
 
-    The ending-validity rule says an origin price blew straight through never
-    ended a leg. When that becomes true only later — the origin is taken out
-    before one appears on the other side — the leg it closed has to reopen and
-    absorb the next. Guards the case where legs_index grows monotonically
-    because the stale tail was never deleted.
+    This used to assert that some takeout in the fixture shrank the chain, which
+    was the observable signal that an unseated ending had merged two legs. That
+    stopped being reachable on 2026-09-15: the takeout rule now asks about the
+    origin's **own** side and spares any leg that became something, and no
+    takeout in this fixture qualifies. The test said so itself rather than
+    passing vacuously, which is why it is being rewritten instead of deleted.
+
+    The underlying risk is unchanged and is what is asserted now — `legs_index`
+    growing monotonically because a stale tail was never removed. It is checked
+    directly by shrinking the input and requiring the index to follow, so it does
+    not depend on the fixture happening to contain a qualifying event.
     """
     symbol, timeframe = stream['symbol'], '15m'
     data = stream['timeframes'][timeframe]
     _seed_moves(data['moves'], redis_client)
+    _seed_mths(data.get('mths', {}), redis_client)
     origins = data['origins']
-
     complete_index = f'{symbol}:{timeframe}:complete_origins_index'
-    shrank = False
-    previous = 0
+    legs_index = f'{symbol}:{timeframe}:legs_index'
+
+    seen = []
     for _, kind, zid in _events(origins):
         state = _state_at(origins[zid], kind)
         redis_client.hset(zid, mapping=state)
         redis_client.zadd(complete_index, {zid: int(state['time'])})
         maintain_legs(Zone.initiate_zone(state), redis_client)
-        count = redis_client.zcard(f'{symbol}:{timeframe}:legs_index')
-        if count < previous:
-            shrank = True
-        previous = count
+        seen.append(zid)
 
-    assert shrank, (
-        'no takeout in the fixture ever invalidated a leg ending — the merge '
-        'path is untested, so this fixture no longer covers what it claims'
+    full = redis_client.zrange(legs_index, 0, -1)
+    assert full, 'the fixture produced no legs at all'
+
+    # Take the later half of the origins away and rebuild. The chain must lose
+    # the legs they supported, and leave no hash behind for them.
+    keep = sorted({z for z in seen}, key=lambda z: int(z.rsplit(':', 1)[1]))
+    drop = keep[len(keep) // 2:]
+    assert drop, 'not enough origins in the fixture to drop any'
+    redis_client.zrem(complete_index, *drop)
+    refresh_legs(symbol, timeframe, redis_client)
+
+    shrunk = redis_client.zrange(legs_index, 0, -1)
+    assert len(shrunk) < len(full), (
+        f'index did not shrink after removing {len(drop)} origins: '
+        f'{len(full)} -> {len(shrunk)}'
+    )
+    orphans = [lid for lid in full if lid not in set(shrunk)
+               and redis_client.exists(lid)]
+    assert not orphans, (
+        f'{len(orphans)} leg hash(es) survived a rebuild that no longer produces '
+        f'them, e.g. {orphans[:3]}'
     )
