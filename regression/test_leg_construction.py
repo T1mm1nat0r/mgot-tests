@@ -123,15 +123,36 @@ def test_an_opposite_origin_starts_the_next_leg_at_the_last_end():
 
 
 def test_an_ending_taken_out_with_nothing_since_hands_the_leg_back():
-    """The leg it started never moved, so the turn failed."""
+    """The leg it started never moved, so the turn failed.
+
+    The bear leg is handed back and keeps extending — it reaches 75.0 on the
+    second MTH, *after* the takeout, which is the whole point.
+
+    The third origin then opens a bull leg that has no MTH of its own yet. That
+    one is kept (2026-09-17): `_settle` drops a leg whose end never passed its
+    start, and that rule cannot tell "never moved" from "has not moved yet".
+    Applied to the **active** leg it hid the leg currently forming, so
+    `leg_at_time` answered with the previous leg in the opposite direction —
+    which inverts the SS gate. This assertion counted legs and so encoded the
+    drop; it now names what it actually means to check.
+    """
     origins = [
         _origin(T0, 1, 110.0),
         _origin(T0 + 10 * D, 0, 90.0, completed=T0 + 11 * D, taken_out=T0 + 12 * D),
         _origin(T0 + 30 * D, 0, 70.0),
     ]
     out = build(origins, [_mth(T0 + 5 * D, 0, 85.0), _mth(T0 + 20 * D, 0, 75.0)])
-    assert len(out) == 1, [(int(l.start_time), int(l.direction)) for l in out]
-    assert int(out[0].direction) == 0 and float(out[0].extreme) == 75.0
+    handed_back = out[0]
+    assert int(handed_back.direction) == 0 and float(handed_back.extreme) == 75.0
+    assert int(handed_back.end_time) == T0 + 20 * D
+    # Exactly one settled leg: the takeout dissolved the bull leg rather than
+    # leaving it in the chain.
+    settled = [l for l in out if int(l.complete or 0)]
+    assert len(settled) == 1, [(int(l.start_time), int(l.direction)) for l in out]
+    # Plus the leg the third origin opened, still forming.
+    active = out[-1]
+    assert int(active.complete or 0) == 0 and int(active.direction) == 1
+    assert int(active.start_time) == T0 + 20 * D
 
 
 def test_an_ending_whose_leg_became_something_is_not_handed_back():

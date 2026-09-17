@@ -1,4 +1,4 @@
-"""Replay stored NQU6 15m bars through the live pipeline, the way 02 emits them.
+"""Replay stored CME futures bars through the live pipeline, the way 02 emits them.
 
 NQ has no ingest path: `01_retriever` is Binance-only and never reads
 `mgot:research_symbols`, and the Massive loader writes to a scratch db by its own
@@ -23,9 +23,49 @@ sys.path.insert(0, '/Users/timothy/Projects/MGOT/utils/src')
 from mgot_utils import (Bar, connect_to_redis, produce, assign_move,
                         retrieve_window, clear_all_data)
 
-SYMBOL, TF = 'NQU6', '15m'
+TF = '15m'
 STREAM_OUT = 'stream:clean_candles'
 OHLCV = ('open', 'high', 'low', 'close', 'volume')
+
+
+def rows_from_backup(path: str) -> list[dict]:
+    """Bars from a `{tf: {"hashes": {...}}}` dump, or from JSON lines.
+
+    Two shapes because two things write them: the original NQU6 dump nests by
+    timeframe, and a straight `hgetall` export writes one bar per line. Sniffing
+    the first character is enough to tell them apart and costs nothing.
+    """
+    with open(path) as f:
+        head = f.read(1)
+        f.seek(0)
+        if head == '{':
+            try:
+                return list(json.load(f)[TF]['hashes'].values())
+            except (KeyError, TypeError, ValueError):
+                f.seek(0)
+        return [h for h in (json.loads(x) for x in f if x.strip())
+                if h.get('timeframe', TF) == TF]
+
+
+def rows_from_db(symbol: str, db: int) -> list[dict]:
+    """Bars straight out of a scratch db — where `fetch_massive_bars` puts them.
+
+    The fetch loader writes to a scratch keyspace and stops there, so without
+    this the only way into the pipeline was a hand-made backup file in the one
+    shape this script used to accept.
+    """
+    # A plain client, not `connect_to_redis`: that one takes its db from
+    # `REDIS_DB` and pools per process, so asking it for a scratch db would
+    # either be ignored or repoint the connection the replay writes through.
+    import os, redis as _redis
+    src = _redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
+                       port=int(os.getenv('REDIS_PORT', 6379)),
+                       db=db, decode_responses=True)
+    ids = src.zrange(f'{symbol}:{TF}:bars_index', 0, -1)
+    pipe = src.pipeline(transaction=False)
+    for zid in ids:
+        pipe.hgetall(zid)
+    return [h for h in pipe.execute() if h]
 
 
 def clean_bar(h: dict) -> Bar:
@@ -42,13 +82,26 @@ def attach_move(bar: Bar, r) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument('--backup', required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument('--backup', help='bars from a dump file')
+    src.add_argument('--from-db', type=int,
+                     help='bars from a scratch redis db, e.g. 13 — where '
+                          'fetch_massive_bars stores them')
+    ap.add_argument('--symbol', default='NQU6',
+                    help='contract to replay, e.g. NQZ6. Each expiry is its own '
+                         'symbol: the December contract trades above the '
+                         'September one by roughly the carry, so concatenating '
+                         'them would mint an MTH out of the roll gap.')
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--dry-run', action='store_true')
     a = ap.parse_args()
+    SYMBOL = a.symbol
 
-    data = json.load(open(a.backup))[TF]
-    rows = sorted(data['hashes'].values(), key=lambda h: int(h['time']))
+    rows = (rows_from_backup(a.backup) if a.backup
+            else rows_from_db(SYMBOL, a.from_db))
+    rows = sorted(rows, key=lambda h: int(h['time']))
+    if not rows:
+        print(f'no {SYMBOL} {TF} bars found'); return 1
     if a.limit:
         rows = rows[:a.limit]
     print(f'{len(rows)} bars  {rows[0]["time"]} -> {rows[-1]["time"]}')
@@ -63,7 +116,7 @@ def main() -> int:
         return 0
 
     r = connect_to_redis()
-    print('clearing NQU6 derived state (bars included — they are re-created below)')
+    print(f'clearing {SYMBOL} derived state (bars included — re-created below)')
     print(' ', clear_all_data(SYMBOL, r))
     r.hset(f'ingestion:{SYMBOL}:status', mapping={
         'mode': 'historic', 'bars_processed': 0, 'pipeline_processed': 0,

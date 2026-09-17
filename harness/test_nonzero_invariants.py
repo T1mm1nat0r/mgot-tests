@@ -215,3 +215,55 @@ def test_the_dance_is_not_stuck_in_one_direction(replayed):
         f'the dance only ever recorded state {states.pop()!r} — it resets but '
         f'never advances'
     )
+
+
+@pytest.mark.integration
+def test_the_leg_chain_never_falls_behind_the_definition(replayed, production):
+    """After every bar, `legs_index` must equal `build_legs`.
+
+    The chain is rebuilt when an origin completes **and** when an MTH is drawn.
+    The second hook was missing until 2026-09-17, and without it the stored chain
+    trails the definition: an MTH inside the horizon is indexed when its move
+    *ends*, routinely after the last origin completed, so `build_legs` sees it
+    and the chain does not.
+
+    A/B over 690 bars of BTCUSDT 15m through the real services: **behind on 240
+    bars (34.8%) with the MTH hook removed, 0 with it**. It is always the tail,
+    so it is the *active* leg that is wrong — and that is what `_with_leg` asks
+    about. On one 15m window the stale chain was missing the active leg outright
+    (its only MTH arrived after the last origin, so it had never moved and the
+    cleanup dropped it) and `leg_at_time` answered "bull" where the truth was
+    "bear", inverting an SS gate verdict.
+
+    Steps bars one at a time *after* the shared replay, because the failure is
+    invisible at a window boundary: whether the end state matches depends on
+    whether the last event happened to be an origin.
+    """
+    from mgot_utils.processing.legs import build_legs
+    from mgot_utils.models.leg import Leg
+
+    r = replayed.r
+    last = int(r.zrange(f'{SYMBOL}:{TIMEFRAME}:bars_index', -1, -1,
+                        withscores=True)[0][1])
+    nxt = production.zrangebyscore(
+        f'{SYMBOL}:{TIMEFRAME}:bars_index', f'({last}', '+inf', start=0, num=40)
+    if len(nxt) < 10:
+        pytest.skip('not enough production bars past the replay window')
+
+    sig = lambda l: (int(l.start_time), int(l.end_time or 0), int(l.direction),
+                     round(float(l.extreme), 6))
+    behind = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        for key in nxt:
+            replayed.load_bars([production.hgetall(key)])
+            replayed.run()
+            built = [sig(l) for l in build_legs(SYMBOL, TIMEFRAME, r)]
+            ids = r.zrange(f'{SYMBOL}:{TIMEFRAME}:legs_index', 0, -1)
+            stored = [sig(Leg.initiate_leg(d)) for d in _hashes(r, ids)]
+            if built and stored != built:
+                behind.append((key, len(stored), len(built)))
+
+    assert not behind, (
+        f'stored chain fell behind the definition on {len(behind)} of '
+        f'{len(nxt)} bars — first {behind[0][0]} '
+        f'(stored {behind[0][1]} legs, definition {behind[0][2]})')
