@@ -196,9 +196,112 @@ class TestBarSpan:
 
     def test_the_pause_is_invisible_above_1h(self, profile):
         """4 bars on 15m, 1 on 1h, 0 on 4h — which is why the daily pause only
-        really matters on the timeframe we validate on."""
+        really matters on the timeframe we validate on.
+
+        This pins duration arithmetic, not where 4h bars sit: `create_lvls`
+        calls `bar_span(0, delta_t, tf)` to size a gap, and neither 16:00 nor
+        20:00 ET is a 4h bar since bars count from the session open
+        (`TestSessionGrid`). `bar_span` was left on the clock for that reason."""
         a, b = at(2026, 7, 1, 16, 0), at(2026, 7, 1, 20, 0)
         assert profile.bar_span(a, b, '4h') == MarketProfile(DELTA).bar_span(a, b, '4h')
+
+
+class TestSessionGrid:
+    """Bars count from the 18:00 ET session open, not from midnight UTC.
+
+    As TradingView, Sierra Chart, TradeStation and Tradovate draw them. On the
+    clock grid NQ's 20:00 UTC 4h bar straddled the daily pause, and `02`
+    dropped it every day for the missing minutes — one 4h bar in six, and every
+    daily and weekly bar (2026-09-18).
+    """
+
+    @pytest.fixture
+    def profile(self):
+        return SessionMarketProfile(
+            DELTA, early_closes=SessionMarketProfile.CME_EARLY_CLOSES_2026)
+
+    def test_4h_bars_open_at_18_22_02_06_10_14_et(self, profile):
+        opens = [at(2026, 7, 7, 18), at(2026, 7, 7, 22), at(2026, 7, 8, 2),
+                 at(2026, 7, 8, 6), at(2026, 7, 8, 10), at(2026, 7, 8, 14)]
+        for o in opens:
+            assert profile.bar_open(o + 3_599_999, '4h') == o
+        assert [profile.advance(o, '4h', 1) for o in opens] == opens[1:] + [at(2026, 7, 8, 18)]
+
+    def test_the_last_4h_bar_is_three_hours(self, profile):
+        """The session closes at 17:00, so the pause is between bars."""
+        assert profile.bar_end(at(2026, 7, 8, 14), '4h') == at(2026, 7, 8, 17)
+        assert profile.bar_end(at(2026, 7, 8, 10), '4h') == at(2026, 7, 8, 14)
+
+    def test_the_pause_has_no_bar(self, profile):
+        assert profile.bar_open(at(2026, 7, 8, 17, 30), '4h') is None
+        assert profile.bar_open(at(2026, 7, 11, 12), '1d') is None      # Saturday
+
+    def test_up_to_1h_the_session_grid_is_the_clock_grid(self, profile):
+        """Every session opens on the hour, so nothing below 4h moved."""
+        cont = MarketProfile(DELTA)
+        t = at(2026, 7, 7, 18)
+        while t < at(2026, 7, 8, 17):
+            for tf in ('3m', '15m', '1h'):
+                assert profile.bar_open(t, tf) == cont.bar_open(t, tf), (tf, t)
+            t += 7 * 60_000
+
+    def test_a_day_is_a_session(self, profile):
+        assert profile.bar_open(at(2026, 7, 8, 10), '1d') == at(2026, 7, 7, 18)
+        assert profile.bar_end(at(2026, 7, 7, 18), '1d') == at(2026, 7, 8, 17)
+        assert profile.advance(at(2026, 7, 7, 18), '1d', 1) == at(2026, 7, 8, 18)
+        assert profile.advance(at(2026, 7, 9, 18), '1d', 1) == at(2026, 7, 12, 18)
+        assert profile.advance(at(2026, 7, 12, 18), '1d', -1) == at(2026, 7, 9, 18)
+
+    def test_a_week_runs_sunday_evening_to_friday_close(self, profile):
+        week = at(2026, 7, 5, 18)
+        assert profile.bar_open(at(2026, 7, 8, 12), '1w') == week
+        assert profile.bar_end(week, '1w') == at(2026, 7, 10, 17)
+        assert profile.advance(week, '1w', 1) == at(2026, 7, 12, 18)
+        assert profile.advance(at(2026, 7, 12, 18), '1w', -1) == week
+
+    def test_an_early_close_cuts_the_bar_it_lands_in(self, profile):
+        """Labor Day stopped at 13:00 and reopened at 18:00; 3 Jul ended the week."""
+        assert profile.bar_open(at(2026, 9, 7, 12, 30), '4h') == at(2026, 9, 7, 10)
+        assert profile.bar_end(at(2026, 9, 7, 10), '4h') == at(2026, 9, 7, 13)
+        assert profile.advance(at(2026, 9, 7, 10), '4h', 1) == at(2026, 9, 7, 18)
+        assert profile.bar_end(at(2026, 6, 28, 18), '1w') == at(2026, 7, 3, 13)
+        assert profile.advance(at(2026, 7, 3, 10), '4h', 1) == at(2026, 7, 5, 18)
+        assert profile.advance(at(2026, 7, 5, 18), '4h', -1) == at(2026, 7, 3, 10)
+
+    def test_it_walks_over_the_weekend_both_ways(self, profile):
+        assert profile.advance(at(2026, 7, 10, 14), '4h', 1) == at(2026, 7, 12, 18)
+        assert profile.advance(at(2026, 7, 12, 18), '4h', -1) == at(2026, 7, 10, 14)
+        assert profile.advance(at(2026, 7, 7, 18), '4h', 12) == at(2026, 7, 9, 18)
+        assert profile.advance(at(2026, 7, 9, 18), '4h', -12) == at(2026, 7, 7, 18)
+
+    def test_it_crosses_a_dst_weekend(self, profile):
+        """US DST ended 2026-11-01. Stepping 24h in UTC from Saturday 18:00 EDT
+        lands on Sunday 17:00 EST and then in every pause after it — the old
+        arithmetic ran out of week and raised on daily bars."""
+        assert profile.advance(at(2026, 10, 30, 14), '4h', 1) == at(2026, 11, 1, 18)
+        assert profile.advance(at(2026, 10, 29, 18), '1d', 1) == at(2026, 11, 1, 18)
+        assert profile.advance(at(2026, 10, 25, 18), '1w', 1) == at(2026, 11, 1, 18)
+        assert profile.advance(at(2026, 11, 1, 18), '4h', -1) == at(2026, 10, 30, 14)
+        assert profile.advance(at(2026, 11, 1, 18), '1d', -1) == at(2026, 10, 29, 18)
+        assert profile.bar_end(at(2026, 11, 2, 14), '4h') == at(2026, 11, 2, 17)
+
+    def test_from_a_shut_instant_it_finds_the_nearest_bar(self, profile):
+        assert profile.advance(at(2026, 7, 8, 17, 30), '4h', 1) == at(2026, 7, 8, 18)
+        assert profile.advance(at(2026, 7, 8, 17, 30), '4h', -1) == at(2026, 7, 8, 14)
+        assert profile.advance(at(2026, 7, 11, 12), '1w', 1) == at(2026, 7, 12, 18)
+
+
+def test_continuous_bars_sit_on_the_clock():
+    """BTC's windows are the ones `calc_modulos` closed: unchanged."""
+    from mgot_utils.core.timeframe_logic import calc_modulos
+    config = Config()
+    profile = config.profile_for('BTCUSDT')
+    for tf, delta in config.delta_epoch.items():
+        for t in range(1_782_864_000_000, 1_782_864_000_000 + 3 * 86_400_000, 1_140_000):
+            opened = profile.bar_open(t, tf)
+            assert opened == t - t % delta
+            assert profile.bar_end(opened, tf) == opened + delta
+            assert (calc_modulos(t, tf, config) == 0) == (t + 60_000 == profile.bar_end(opened, tf))
 
 
 class TestGapValidation:
