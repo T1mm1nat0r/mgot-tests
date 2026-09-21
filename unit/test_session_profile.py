@@ -321,6 +321,71 @@ class TestGapValidation:
             profile.assert_gap_explained(a, b, '15m')
 
 
+class TestForexCalendar:
+    """FX is the session market without the pause: 17:00 ET to 17:00 ET, five days.
+
+    Same machinery as CME with two constants moved, so what is tested here is
+    that the constants land where FX actually trades — and that 24 hours divided
+    by 4 leaves no short bar, unlike NQ's 23.
+    """
+
+    @pytest.fixture
+    def fx(self):
+        from mgot_utils.core.configs import ForexMarketProfile
+        return ForexMarketProfile(DELTA)
+
+    def test_it_trades_through_the_cme_pause(self, fx):
+        """17:00-18:00 ET is shut on NQ and open here — the whole difference."""
+        assert fx.is_open(at(2026, 7, 1, 17, 30))
+        assert not SessionMarketProfile(DELTA).is_open(at(2026, 7, 1, 17, 30))
+
+    def test_the_week_runs_sunday_1700_to_friday_1700(self, fx):
+        assert not fx.is_open(at(2026, 7, 12, 16, 45))     # Sunday, before the open
+        assert fx.is_open(at(2026, 7, 12, 17, 0))
+        assert fx.is_open(at(2026, 7, 10, 16, 45))         # Friday, before the close
+        assert not fx.is_open(at(2026, 7, 10, 17, 0))
+        assert not fx.is_open(at(2026, 7, 11, 12))         # Saturday
+
+    def test_4h_bars_run_17_21_01_05_09_13_et(self, fx):
+        opens = [at(2026, 7, 7, 17), at(2026, 7, 7, 21), at(2026, 7, 8, 1),
+                 at(2026, 7, 8, 5), at(2026, 7, 8, 9), at(2026, 7, 8, 13)]
+        for o in opens:
+            assert fx.bar_open(o + 3_599_999, '4h') == o
+        assert [fx.advance(o, '4h', 1) for o in opens] == opens[1:] + [at(2026, 7, 8, 17)]
+
+    def test_no_short_bar_since_24_divides_by_4(self, fx):
+        """NQ's 14:00 bar is three hours; FX has no such bar."""
+        for o in (at(2026, 7, 8, 13), at(2026, 7, 8, 9), at(2026, 7, 7, 17)):
+            assert fx.bar_end(o, '4h') - o == DELTA['4h']
+
+    def test_a_day_is_1700_to_1700(self, fx):
+        assert fx.bar_open(at(2026, 7, 8, 10), '1d') == at(2026, 7, 7, 17)
+        assert fx.bar_end(at(2026, 7, 7, 17), '1d') == at(2026, 7, 8, 17)
+        assert fx.advance(at(2026, 7, 9, 17), '1d', 1) == at(2026, 7, 12, 17)   # Thu -> Sun
+
+    def test_a_week_runs_sunday_evening_to_friday_close(self, fx):
+        week = at(2026, 7, 5, 17)
+        assert fx.bar_open(at(2026, 7, 8, 12), '1w') == week
+        assert fx.bar_end(week, '1w') == at(2026, 7, 10, 17)
+        assert fx.advance(week, '1w', 1) == at(2026, 7, 12, 17)
+
+    def test_it_crosses_a_dst_weekend(self, fx):
+        assert fx.advance(at(2026, 10, 30, 13), '4h', 1) == at(2026, 11, 1, 17)
+        assert fx.advance(at(2026, 11, 1, 17), '4h', -1) == at(2026, 10, 30, 13)
+
+    def test_up_to_1h_it_is_the_clock_grid(self, fx):
+        cont = MarketProfile(DELTA)
+        t = at(2026, 7, 7, 17)
+        while t < at(2026, 7, 8, 17):
+            for tf in ('3m', '15m', '1h'):
+                assert fx.bar_open(t, tf) == cont.bar_open(t, tf), (tf, t)
+            t += 11 * 60_000
+
+    def test_a_minute_with_no_quote_is_not_lost_data(self, fx):
+        """Massive prints only minutes that traded, as on NQ."""
+        assert fx.every_minute_printed is False
+
+
 def test_profile_for_routes_by_product_code():
     """Wired 2026-09-10. NQ contracts get the session calendar; crypto does not.
 
@@ -332,6 +397,11 @@ def test_profile_for_routes_by_product_code():
     for symbol in ('NQU6', 'NQZ6', 'nqz6', 'NQ'):
         assert config.profile_for(symbol).name == 'session', symbol
     for symbol in ('BTCUSDT', 'ETHUSDT', 'SOLUSDT', ''):
+        assert config.profile_for(symbol).name == 'continuous', symbol
+    # FX matched whole, so nothing else can pick up its calendar (2026-09-21).
+    for symbol in ('EURUSD', 'usdjpy', 'GBPJPY', 'AUDUSD'):
+        assert config.profile_for(symbol).name == 'forex', symbol
+    for symbol in ('EURUSDT', 'BTCUSD', 'EUR', 'USDJPYX'):
         assert config.profile_for(symbol).name == 'continuous', symbol
 
 

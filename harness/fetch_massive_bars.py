@@ -50,7 +50,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import redis
 
@@ -80,6 +80,11 @@ BASE = os.environ.get('MASSIVE_BASE_URL', 'https://api.massive.com')
 # 59min; after that, use 1hour."
 RESOLUTIONS = {'1min': '1m', '3min': '3m', '15min': '15m',
                '1hour': '1h', '4hour': '4h', '1day': '1d'}
+
+# The FX endpoint spells a resolution as multiplier + timespan instead.
+FX_RESOLUTIONS = {'1min': ('1', 'minute'), '3min': ('3', 'minute'),
+                  '15min': ('15', 'minute'), '1hour': ('1', 'hour'),
+                  '4hour': ('4', 'hour'), '1day': ('1', 'day')}
 
 # The free tier is 5 requests/minute. Pace deliberately rather than discovering
 # the limit as a 429 halfway through a backfill.
@@ -195,6 +200,42 @@ def fetch(ticker: str, resolution: str, start: str, key: str) -> list[dict]:
     return list({int(r['window_start']): r for r in rows}.values())
 
 
+def fetch_fx(pair: str, resolution: str, start: str, key: str) -> list[dict]:
+    """Spot FX bars. A different endpoint from futures, and a different clock.
+
+    Futures aggregates come from `/futures/v1/aggs` with `window_start` in
+    **nanoseconds**; FX comes from `/v2/aggs/ticker/C:PAIR/range/...` with `t` in
+    **milliseconds** and one-letter fields. Rows are converted to the futures
+    shape here, so `store` and `report_gaps` stay one implementation — the
+    alternative is a second set of field names that drift apart.
+
+    Paged by date window rather than by cursor: the endpoint caps at 50,000 bars,
+    about five weeks of 1m FX, so it walks forward four weeks at a time.
+    """
+    mult, span = FX_RESOLUTIONS[resolution]
+    out: dict[int, dict] = {}
+    cursor = datetime.strptime(start, '%Y-%m-%d').date()
+    today = datetime.now(timezone.utc).date()
+    while cursor <= today:
+        end = min(cursor + timedelta(days=28), today)
+        body = _request(
+            f'/v2/aggs/ticker/C:{urllib.parse.quote(pair)}/range/{mult}/{span}/{cursor}/{end}',
+            {'limit': 50_000, 'sort': 'asc'}, key)
+        page = body.get('results') or []
+        for row in page:
+            out[int(row['t'])] = {
+                'window_start': int(row['t']) * 1_000_000,          # ms -> ns
+                'open': row['o'], 'high': row['h'], 'low': row['l'],
+                'close': row['c'], 'volume': row.get('v', 0),
+            }
+        print(f'   {cursor} .. {end}: {len(page)} bars', flush=True)
+        if len(page) >= 50_000:
+            print('   WARNING: page hit the 50,000 cap — narrow the window', flush=True)
+        cursor = end + timedelta(days=1)
+        time.sleep(FREE_TIER_SLEEP)
+    return list(out.values())
+
+
 def store(rows: list[dict], symbol: str, timeframe: str, r) -> int:
     pipe = r.pipeline()
     index = f'{symbol}:{timeframe}:bars_index'
@@ -217,8 +258,11 @@ def report_gaps(rows: list[dict], timeframe: str, symbol: str) -> None:
     A dropped bar and a session boundary look identical in a gap listing, and
     treating a vendor's omission as a closure silently rewrites the calendar.
     """
-    from mgot_utils.core.configs import Config, SessionMarketProfile
-    profile = SessionMarketProfile(Config().delta_epoch)
+    # Routed by symbol, not hardcoded: FX keeps trading through the hour CME
+    # pauses, so checking FX bars against the CME calendar would report a gap
+    # every weekday evening and miss a real one at the FX close.
+    from mgot_utils.core.configs import Config
+    profile = Config().profile_for(symbol)
     times = sorted(int(r['window_start']) // 1_000_000 for r in rows)
     delta = Config().delta_epoch[timeframe]
     explained = unexplained = 0
@@ -247,7 +291,9 @@ def main() -> int:
                     help='list outright contracts for a product code (e.g. NQ) and exit')
     ap.add_argument('--spreads', action='store_true',
                     help='include calendar spreads in --list-contracts')
-    ap.add_argument('--ticker', help='one contract, e.g. NQZ6')
+    ap.add_argument('--ticker', help='one contract, e.g. NQZ6, or an FX pair with --fx, e.g. EURUSD')
+    ap.add_argument('--fx', action='store_true',
+                    help='fetch spot FX instead of futures (different endpoint and clock)')
     ap.add_argument('--store-as', default=None, help='symbol to store under (default: --ticker)')
     ap.add_argument('--resolution', default='15min', choices=sorted(RESOLUTIONS))
     ap.add_argument('--start', help='YYYY-MM-DD')
@@ -272,7 +318,7 @@ def main() -> int:
     print(f'{args.ticker} {args.resolution} from {args.start} '
           f'-> db {args.db} as {symbol}:{timeframe}')
 
-    rows = fetch(args.ticker, args.resolution, args.start, key)
+    rows = (fetch_fx if args.fx else fetch)(args.ticker, args.resolution, args.start, key)
     if not rows:
         raise SystemExit('no bars returned')
 
